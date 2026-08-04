@@ -70,6 +70,29 @@ _VIEW_KEYS = [
 ]
 
 
+# ── FlashRT warmup ────────────────────────────────────────────────────────────
+
+def _warmup_flashrt(model, task: str, state_dim: int, n_iters: int = 20) -> None:
+    """Run n_iters dummy predict() calls to trigger CUDA graph capture.
+
+    FlashRT captures a static CUDA graph on the first call (can take 1–60 s).
+    Warming up before the robot loop ensures that latency is paid upfront
+    rather than on the first live control tick.
+    """
+    import numpy as np
+
+    dummy_img   = np.zeros((224, 224, 3), dtype=np.uint8)
+    dummy_imgs  = [dummy_img] * len(_VIEW_KEYS)
+    dummy_state = np.zeros(state_dim, dtype=np.float32)
+
+    logger.info("Warming up FlashRT (%d iterations)...", n_iters)
+    for i in range(n_iters):
+        model.predict(images=dummy_imgs, prompt=task, state=dummy_state)
+        if (i + 1) % 5 == 0:
+            logger.info("  warmup %d/%d", i + 1, n_iters)
+    logger.info("FlashRT warmup complete")
+
+
 # ── FlashRT backend installation ──────────────────────────────────────────────
 
 def _install_flashrt_backend(ctx, cfg: RolloutConfig) -> None:
@@ -104,6 +127,10 @@ def _install_flashrt_backend(ctx, cfg: RolloutConfig) -> None:
         state_prompt_mode="fixed",
         autotune=3,
     )
+
+    # Warmup: CUDA graph capture happens on the first few calls; run dummy
+    # predictions before the robot loop so the first live tick is fast.
+    _warmup_flashrt(flash_model, task, state_dim, n_iters=20)
 
     # Close over everything the patched method needs
     _model     = flash_model
