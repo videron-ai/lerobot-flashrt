@@ -44,8 +44,11 @@ flash-attn = ["flash-attn"]
 thor-fa4 = ["nvidia-cutlass-dsl==4.5.1", "quack-kernels==0.4.1"]
 all = ["flash-rt[torch,jax,server,eval,minimax-remover]"]
 
+[tool.pytest.ini_options]
+pythonpath = ["."]
+
 [tool.setuptools.packages.find]
-include = ["flash_rt*"]
+include = ["flash_rt*", "lerobot_flashrt*"]
 
 [tool.setuptools.package-data]
 flash_rt = ["*.so", "*.yaml", "*.model"]

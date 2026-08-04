@@ -69,8 +69,9 @@ def main():
                              "gr1, robocasa_panda_omron, behavior_r1_pro. "
                              "Any other tag emits noise.")
     parser.add_argument('--action_horizon', type=int, default=None,
-                        help="GROOT only. Number of action steps to generate "
-                             "(default 50; pass 16 for LIBERO)")
+                        help="Number of action steps to generate. "
+                             "For pi05/pi0: sets chunk size (default 10; pass 30 for a 30-step chunk). "
+                             "For GROOT: sets action horizon (default 50; pass 16 for LIBERO).")
     parser.add_argument('--use_fp4', action='store_true',
                         help="Pi0.5 torch only. Enable NVFP4 quantization "
                              "with the production preset: full 18 encoder "
@@ -106,7 +107,6 @@ def main():
         use_fp16=args.use_fp16,
         use_fp8=not args.use_fp16,
     )
-
     img = np.random.randint(0, 255, (224, 224, 3), dtype=np.uint8)
     # Supply ``num_views`` images. The public API accepts up to 3 views
     # (image / wrist_image / wrist_image_right); sending the wrong count
@@ -116,6 +116,7 @@ def main():
         images=imgs,
         prompt=args.prompt,
     )
+    print(actions)
     # ══════════════════════════════════════════
 
     print(f"\nactions: shape={actions.shape}, sample={actions[0,:5].round(4)}")

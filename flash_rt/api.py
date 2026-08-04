@@ -366,9 +366,10 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
             slots. For a working demo pick one of ``"gr1"``,
             ``"robocasa_panda_omron"``, or ``"behavior_r1_pro"``. Any other
             tag prints a warning and emits noise-like actions.
-        action_horizon: GROOT only. Number of action steps to generate per
-            inference (default = ``ACTION_HORIZON_MAX`` = 50). Set to a
-            smaller value (e.g. 16 for LIBERO) to reduce DiT compute.
+        action_horizon: Number of action steps to generate per inference.
+            For pi05/pi0: sets the action chunk size (default 10; pass 30
+            for a 30-step chunk). For GROOT: sets the action horizon
+            (default = ``ACTION_HORIZON_MAX`` = 50; pass 16 for LIBERO).
         use_fp4: Pi0.5 torch and JAX on Thor. If True, enable NVFP4
             quantization on the selected encoder FFN layers (Gate+Up + Down
             GEMMs). Requires SM100+ GPU (Thor SM110) and the flash_rt_fp4
@@ -755,6 +756,10 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
             kwargs["vision_num_layers"] = vision_num_layers
         if cache_frames is not None and "cache_frames" in sig.parameters:
             kwargs["cache_frames"] = cache_frames
+        # Pi0.5/Pi0 action chunk length — action_horizon doubles as chunk_size
+        # for these models (GROOT uses it for action_horizon directly above).
+        if action_horizon is not None and "chunk_size" in sig.parameters:
+            kwargs["chunk_size"] = action_horizon
         # Pi0.5 state-in-prompt graph strategy: "exact" (default, per-length
         # capture) / "fixed" (opt-in, one graph). Forwarded only if accepted.
         if "state_prompt_mode" in sig.parameters:

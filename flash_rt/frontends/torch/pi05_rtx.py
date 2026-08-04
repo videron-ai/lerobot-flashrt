@@ -32,7 +32,6 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from flash_rt.core.utils.actions import unnormalize_actions, LIBERO_ACTION_DIM
 from flash_rt.frontends._fp8_layout import select_fp8_layout
 from flash_rt.hardware.rtx.attn_backend import RtxFlashAttnBackend
 from flash_rt.models.pi05.pipeline_rtx import (
@@ -1604,14 +1603,12 @@ class Pi05TorchFrontendRtx:
         self.latency_records.append(latency_ms)
 
         raw_actions = self._noise_out.float().cpu().numpy()  # (chunk, 32)
-        unnorm = unnormalize_actions(raw_actions, self.norm_stats)
-        robot_actions = unnorm[:, :LIBERO_ACTION_DIM]
 
         if debug:
             logger.info("Raw actions[0,:5]: %s", raw_actions[0, :5])
             logger.info("Latency: %.1f ms", latency_ms)
 
-        return {"actions": robot_actions}
+        return {"actions": raw_actions}
 
     def _infer_cfg_batched(self, observation: dict,
                            debug: bool = False) -> dict:
@@ -1655,15 +1652,13 @@ class Pi05TorchFrontendRtx:
         self.latency_records.append(latency_ms)
 
         raw_actions = self._noise_out.float().cpu().numpy()
-        unnorm = unnormalize_actions(raw_actions, self.norm_stats)
-        robot_actions = unnorm[:, :LIBERO_ACTION_DIM]
 
         if debug:
             logger.info(
                 "CFG batched raw actions[0,:5]: %s", raw_actions[0, :5])
             logger.info("CFG batched latency: %.1f ms", latency_ms)
 
-        return {"actions": robot_actions}
+        return {"actions": raw_actions}
 
     # -----------------------------------------------------------------
     # Batched (B=2) inference path — additive, default API unchanged
@@ -1870,8 +1865,7 @@ class Pi05TorchFrontendRtx:
         results = []
         for b in range(PI05_BATCH_SIZE):
             raw = self._noise_out_b2[b].float().cpu().numpy()
-            unnorm = unnormalize_actions(raw, self.norm_stats)
-            results.append({"actions": unnorm[:, :LIBERO_ACTION_DIM]})
+            results.append({"actions": raw})
         return results
 
     def get_latency_stats(self) -> dict:

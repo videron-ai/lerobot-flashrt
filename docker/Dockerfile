@@ -29,7 +29,7 @@ FROM ${BASE_IMAGE}
 #              different GPU than the build host.
 #   GIT_REF    optional CUTLASS pin if upstream tags get yanked.
 #   FA2_HDIMS  forwarded to CMake to slim FA2 codegen for shipped models.
-ARG GPU_ARCH=""
+ARG GPU_ARCH=121 #Explicily set this
 ARG CUTLASS_REF=v4.4.2
 ARG FA2_HDIMS=""
 
@@ -77,7 +77,7 @@ RUN mkdir -p third_party && ln -sfn /opt/cutlass third_party/cutlass
 RUN cmake -B build -S . \
         $( [ -n "${GPU_ARCH}" ] && echo "-DGPU_ARCH=${GPU_ARCH}" ) \
         $( [ -n "${FA2_HDIMS}" ] && echo "-DFA2_HDIMS=${FA2_HDIMS}" ) \
- && cmake --build build -j"$(nproc)" \
+ && cmake --build build -j 10 \ ##Changed num jobs to 10!
  && rm -rf build/CMakeFiles
 
 # ── Editable install — registers flash_rt with the system Python so

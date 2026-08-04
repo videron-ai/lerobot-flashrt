@@ -40,7 +40,6 @@ import torch.nn.functional as F
 
 import flash_rt.flash_rt_kernels as fvk
 from flash_rt.core.cuda_buffer import CudaBuffer
-from flash_rt.core.utils.actions import unnormalize_actions, LIBERO_ACTION_DIM
 from flash_rt.core.utils.pi05_prompt import PI05_STATE_PROMPT_MAX_LEN
 from flash_rt.core.quant.calibrator import load_calibration, save_calibration
 
@@ -129,13 +128,17 @@ class Pi05TorchFrontendThor:
     def __init__(self, checkpoint_dir: str, num_views: int = 2,
                  use_cuda_graph: bool = True, autotune: int = 3,
                  use_fp8: bool = True, state_prompt_mode: str = "exact",
-                 state_prompt_fixed_max_len: Optional[int] = None):
+                 state_prompt_fixed_max_len: Optional[int] = None,
+                 chunk_size: int = 10):
         """
         Args:
             autotune: CUDA Graph autotune trials per set_prompt().
                 0 = off, 3 = default (fast), 5+ = thorough.
                 Torch usually finds fast graph on trial 0-1.
+            chunk_size: action chunk length (default 10; pass 30 for a
+                30-step chunk).
         """
+        self.chunk_size = int(chunk_size)
         checkpoint_dir = pathlib.Path(checkpoint_dir)
         _spm = os.environ.get("FLASHRT_PI05_STATE_PROMPT_MODE", state_prompt_mode)
         if _spm not in ("fixed", "exact"):
@@ -436,7 +439,7 @@ class Pi05TorchFrontendThor:
         self._enc_rope = torch.empty(Se_max, 256, dtype=fp16, device='cuda')
 
         # KV cache
-        Sa, Da, Ha, La = 10, 1024, 4096, 18
+        Sa, Da, Ha, La = self.chunk_size, 1024, 4096, 18
         self.Sa = Sa; self.Da = Da; self.Ha = Ha; self.La = La
         total_keys_max = Se_max + Sa
         self._Kc = torch.zeros(Le, total_keys_max, HDe, dtype=fp16, device='cuda')
@@ -981,14 +984,12 @@ class Pi05TorchFrontendThor:
         latency_ms = (time.perf_counter() - t0) * 1000
         self.latency_records.append(latency_ms)
 
-        unnorm = unnormalize_actions(raw_actions, self.norm_stats)
-        robot_actions = unnorm[:, :LIBERO_ACTION_DIM]
         if debug:
             logger.info(
                 "CFG raw[0,:5]: %s, latency: %.1f ms (beta=%.2f)",
                 raw_actions[0, :5], latency_ms,
                 self._cfg_pipeline.cfg_beta)
-        return {"actions": robot_actions}
+        return {"actions": raw_actions}
 
     def set_prompt(self, prompt_text, state=None):
         """Tokenize prompt, compute time conditioning, calibrate scales, capture graphs.
@@ -2435,9 +2436,8 @@ class Pi05TorchFrontendThor:
         for b in range(self.B):
             raw = self._g_noise_b2[b * self.Sa : (b + 1) * self.Sa
                                     ].float().cpu().numpy()
-            unnorm = unnormalize_actions(raw, self.norm_stats)
             results.append(
-                {"actions": unnorm[:, :LIBERO_ACTION_DIM]})
+                {"actions": raw})
         return results
 
     # -----------------------------------------------------------------------
@@ -2513,7 +2513,7 @@ class Pi05TorchFrontendThor:
             observation: dict with 'image' and 'wrist_image' (or 'images' list).
                          Each image is (224,224,3) uint8 or float16 numpy.
         Returns:
-            {"actions": np.ndarray}  shape (Sa, LIBERO_ACTION_DIM)
+            {"actions": np.ndarray}  shape (Sa, 32)
         """
         if self._rl_config is not None:
             return self._infer_cfg(observation, debug)
@@ -2570,15 +2570,12 @@ class Pi05TorchFrontendThor:
 
         # ---- Post-process ----
         raw_actions = self._g_noise.float().cpu().numpy()
-        unnorm = unnormalize_actions(raw_actions, self.norm_stats)
-        robot_actions = unnorm[:, :LIBERO_ACTION_DIM]
 
         if debug:
             logger.info("Raw actions[0,:5]: %s", raw_actions[0, :5])
-            logger.info("Robot actions[0]: %s", robot_actions[0])
             logger.info("Latency: %.1f ms", latency_ms)
 
-        return {"actions": robot_actions}
+        return {"actions": raw_actions}
 
     # -----------------------------------------------------------------------
     # Real-data recalibration (called once after first real image)
