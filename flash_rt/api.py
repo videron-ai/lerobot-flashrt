@@ -67,7 +67,8 @@ class VLAModel:
         except Exception:
             return a is b
 
-    def predict(self, images, prompt=None, state=None):
+    def predict(self, images, prompt=None, state=None,
+                prev_actions=None, inference_delay=0):
         """Run inference.
 
         Args:
@@ -79,6 +80,15 @@ class VLAModel:
                    set_prompt() for frontends that encode state in prompt
                    tokens, and attached to the observation for frontends that
                    consume state during infer().
+            prev_actions: Real-Time Chunking previous-chunk tail, shaped
+                   ``(T, action_dim)`` in the same raw (normalized) space this
+                   method returns, or None for the first chunk. The denoiser is
+                   steered toward it over the first ``rtc_execution_horizon``
+                   timesteps so consecutive chunks join smoothly. Requires
+                   ``load_model(..., rtc_guidance=True)``.
+            inference_delay: timesteps the robot consumed while this inference
+                   was running. Those leading timesteps are pinned to the
+                   previous chunk (prefix weight 1.0).
 
         Returns:
             np.ndarray: actions
@@ -143,7 +153,17 @@ class VLAModel:
             self._pipe.calibrate_with_real_data([obs])
             self._needs_real_data_calibration = False
 
-        result = self._pipe.infer(obs)
+        if prev_actions is None and not inference_delay:
+            result = self._pipe.infer(obs)
+        else:
+            import inspect
+            if "prev_actions" not in inspect.signature(self._pipe.infer).parameters:
+                raise NotImplementedError(
+                    f"{type(self._pipe).__name__} does not support RTC prefix "
+                    "guidance (prev_actions / inference_delay).")
+            result = self._pipe.infer(
+                obs, prev_actions=prev_actions,
+                inference_delay=inference_delay)
         return result['actions']
 
     def warm_state_prompt_buckets(self, images, prompt, states):
@@ -300,6 +320,10 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
                use_fp8=True,
                state_prompt_mode="exact",
                state_prompt_fixed_max_len=None,
+               rtc_guidance=False,
+               rtc_execution_horizon=None,
+               rtc_prefix_attention_schedule="exp",
+               rtc_max_guidance_weight=10.0,
                *,
                mmproj_path=None,
                backend="cpu",
@@ -433,6 +457,21 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
             example, a cap near the actual length (120 vs. 117 tokens) measured
             about a 1 ms normal overhead on Thor versus warmed exact mode.
             Env override: ``FLASHRT_PI05_STATE_PROMPT_FIXED_MAX_LEN``.
+        rtc_guidance: Pi0.5 torch RTX only. Arm Real-Time Chunking prefix
+            guidance so ``predict(prev_actions=..., inference_delay=...)``
+            steers each chunk toward the previous chunk's unexecuted tail.
+            Off by default: arming it adds elementwise correction kernels to
+            the captured denoise loop, so the default graph and its numerics
+            are untouched when it is not requested. See
+            ``docs/rtc_prefix_attention.md``.
+        rtc_execution_horizon: Timesteps over which prefix weights decay from
+            1.0 to 0.0. ``None`` uses ``action_horizon`` (the full chunk).
+            Only meaningful with ``rtc_guidance=True``.
+        rtc_prefix_attention_schedule: Decay shape for the prefix weights —
+            ``"exp"`` (default), ``"linear"``, ``"ones"``, or ``"zeros"``.
+            Matches lerobot's ``RTCAttentionSchedule``.
+        rtc_max_guidance_weight: Ceiling on the per-denoise-step guidance
+            weight (default 10.0).
 
     Returns:
         VLAModel instance with .predict() method.
@@ -767,6 +806,19 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
         if (state_prompt_fixed_max_len is not None and
                 "state_prompt_fixed_max_len" in sig.parameters):
             kwargs["state_prompt_fixed_max_len"] = state_prompt_fixed_max_len
+        # RTC prefix guidance: opt-in, because arming it adds the correction
+        # kernels to the captured denoise loop.
+        if rtc_guidance and "rtc_guidance" not in sig.parameters:
+            raise NotImplementedError(
+                f"{pipe_cls.__name__} does not support rtc_guidance.")
+        if "rtc_guidance" in sig.parameters:
+            kwargs["rtc_guidance"] = bool(rtc_guidance)
+            if rtc_execution_horizon is not None:
+                kwargs["rtc_execution_horizon"] = int(rtc_execution_horizon)
+            elif action_horizon is not None:
+                kwargs["rtc_execution_horizon"] = int(action_horizon)
+            kwargs["rtc_prefix_attention_schedule"] = rtc_prefix_attention_schedule
+            kwargs["rtc_max_guidance_weight"] = float(rtc_max_guidance_weight)
         # FP4 frontend accepts these extra kwargs (only set when the class
         # actually accepts them — base class ignores, FP4 subclass uses).
         if use_fp4 and "use_fp4_encoder_ffn" in sig.parameters:

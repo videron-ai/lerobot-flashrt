@@ -305,6 +305,11 @@ class Pi05Pipeline:
         self._graph = None
         self._decoder_only_graph = None  # for temporal K/V caching
         self._graph_stream = None  # ctypes.c_void_p
+
+        # RTC prefix-guidance state (armed by enable_rtc_guidance() before
+        # capture; None keeps the default graph byte-identical).
+        self._rtc = None
+        self._rtc_streams = {}
         from flash_rt.core.cuda_buffer import _cudart
         self._cudart = _cudart
 
@@ -1433,6 +1438,158 @@ class Pi05Pipeline:
     #   Phase C: Gemma-300M decoder (flow matching)
     # ══════════════════════════════════════════════════════════════════
 
+    # ── RTC prefix guidance (identity-Jacobian approximation) ──────────
+    #
+    # Reference (lerobot ``RTCProcessor.denoise_step``) steers the denoiser
+    # toward the previous chunk's unexecuted tail at every flow-matching step:
+    #
+    #     x1 = x - time*v                 # predicted clean chunk
+    #     err = (prev - x1) * w           # w = prefix attention weights
+    #     v' = v - g * J^T err,   J = dx1/dx = I - time*(dv/dx)
+    #
+    # The exact J^T requires a VJP through the denoiser, which this inference
+    # pipeline (custom kernels + CUTLASS GEMMs) has no backward for.  We take
+    # J ~ I, so the correction collapses to pure elementwise arithmetic that
+    # captures into the existing CUDA graph.
+    #
+    # In pipeline terms the out-projection weights are pre-scaled by -1/N, so
+    # ``decoder_action_buf`` holds ``a = -v/N`` and the step is ``x += a``:
+    #
+    #     x1  = x + (time_k * N) * a,  time_k * N = N - k   (exact integer)
+    #     a' = a + (g_k / N) * (prev - x1) * w
+    #
+    # Everything the correction reads lives in fixed-address device buffers
+    # (``rtc_prev_action_chunk``, ``rtc_prefix_weights``, ``rtc_guidance_weight``),
+    # so prefix weights, inference delay and max guidance weight are all
+    # runtime-tunable without recapture.  Zero weights => zero correction, which
+    # is how the first chunk (no previous chunk) is handled.
+
+    def enable_rtc_guidance(self) -> None:
+        """Arm RTC prefix guidance. Must be called before ``record_infer_graph``.
+
+        Idempotent.  Adds ~4 elementwise kernels per denoise step to the
+        captured graph; leaving it disabled keeps the default graph unchanged.
+        """
+        if self._rtc is not None:
+            return
+
+        import torch
+
+        from flash_rt.core.utils.rtc_guidance import guidance_ceiling
+
+        ds, n = self.chunk_size, self.num_steps
+        B = self.bufs
+        bf16_t = torch.bfloat16
+
+        g_bf16 = torch.zeros(n, dtype=bf16_t, device="cuda")
+        self._rtc = {
+            # Views aliasing the pipeline's own device buffers.
+            "x":     B["diffusion_noise"].torch_view((ds, ACTION_DIM), bf16_t),
+            "a":     B["decoder_action_buf"].torch_view((ds, ACTION_DIM), bf16_t),
+            "prev":  B["rtc_prev_action_chunk"].torch_view((ds, ACTION_DIM), bf16_t),
+            "w_f32": B["rtc_prefix_weights"].torch_view((ds,), torch.float32),
+            "gw":    B["rtc_guidance_weight"].torch_view((1,), torch.float32),
+            # Persistent scratch — never allocated inside the captured region.
+            "s":       torch.zeros(ds, ACTION_DIM, dtype=bf16_t, device="cuda"),
+            "w":       torch.zeros(ds, 1, dtype=bf16_t, device="cuda"),
+            "g_f32":   torch.zeros(n, dtype=torch.float32, device="cuda"),
+            "g":       g_bf16,
+            "g_slices": [g_bf16[k] for k in range(n)],
+            # time_k * N == N - k exactly, for time_k = 1 - k/N.
+            "time_n":  [float(n - k) for k in range(n)],
+            "ceiling": torch.from_numpy(guidance_ceiling(n)).cuda(),
+        }
+        # The three RTC ports are device_empty (uninitialized). Zero them so
+        # the warmup / FP8 calibration passes that run before the first
+        # rtc_write_inputs() see an exactly-zero correction rather than
+        # garbage — a NaN here would poison the calibrated activation scales.
+        self._rtc["prev"].zero_()
+        self._rtc["w_f32"].zero_()
+        self._rtc["gw"].zero_()
+        torch.cuda.synchronize()
+        logger.info("RTC prefix guidance armed (chunk=%d, steps=%d)", ds, n)
+
+    @property
+    def rtc_guidance_enabled(self) -> bool:
+        return self._rtc is not None
+
+    def _rtc_torch_stream(self, stream: int):
+        """Torch stream handle matching a raw ``cudaStream_t`` int."""
+        import torch
+
+        key = int(stream)
+        s = self._rtc_streams.get(key)
+        if s is None:
+            s = (torch.cuda.default_stream() if key == 0
+                 else torch.cuda.ExternalStream(key))
+            self._rtc_streams[key] = s
+        return s
+
+    def rtc_write_inputs(self, prev_actions=None, prefix_weights=None,
+                         max_guidance_weight: float = 10.0) -> None:
+        """Stage the per-inference RTC inputs. Call before ``forward()``.
+
+        Args:
+            prev_actions: ``(T, ACTION_DIM)`` previous-chunk tail in raw model
+                (normalized) space, or None for the first chunk.  Shorter/longer
+                chunks are zero-padded / truncated to ``chunk_size``.
+            prefix_weights: ``(chunk_size,)`` prefix attention weights from
+                :func:`flash_rt.core.utils.rtc_guidance.get_prefix_weights`.
+                None (or ``prev_actions=None``) writes zeros, which makes the
+                correction exactly zero.
+            max_guidance_weight: runtime ceiling on the guidance weight.
+        """
+        if self._rtc is None:
+            raise RuntimeError(
+                "rtc_write_inputs() requires enable_rtc_guidance() before capture")
+
+        import torch
+
+        r = self._rtc
+        ds = self.chunk_size
+
+        if prev_actions is None or prefix_weights is None:
+            r["prev"].zero_()
+            r["w_f32"].zero_()
+        else:
+            prev = torch.as_tensor(np.asarray(prev_actions, dtype=np.float32))
+            if prev.ndim != 2:
+                raise ValueError(
+                    f"prev_actions must be 2-D (T, A), got {tuple(prev.shape)}")
+            t, a_dim = prev.shape
+            if a_dim > ACTION_DIM:
+                raise ValueError(
+                    f"prev_actions action dim {a_dim} exceeds {ACTION_DIM}")
+            r["prev"].zero_()
+            r["prev"][:min(t, ds), :a_dim].copy_(prev[:ds].to(torch.bfloat16))
+
+            w = np.asarray(prefix_weights, dtype=np.float32).reshape(-1)
+            if w.shape[0] != ds:
+                raise ValueError(
+                    f"prefix_weights must have length chunk_size={ds}, "
+                    f"got {w.shape[0]}")
+            r["w_f32"].copy_(torch.from_numpy(w))
+
+        r["gw"].fill_(float(max_guidance_weight))
+
+    def _apply_rtc_guidance(self, step: int, stream: int) -> None:
+        """Steer ``decoder_action_buf`` toward the previous chunk for one step."""
+        import torch
+
+        r = self._rtc
+        with torch.cuda.stream(self._rtc_torch_stream(stream)):
+            if step == 0:
+                # g_k = min(ceiling_k, max_guidance_weight) for every step at
+                # once; min(+inf, max_w) reproduces the reference nan_to_num.
+                torch.minimum(r["gw"], r["ceiling"], out=r["g_f32"])
+                r["g"].copy_(r["g_f32"])
+                r["w"].copy_(r["w_f32"].unsqueeze(-1))
+            s = r["s"]
+            torch.sub(r["prev"], r["x"], out=s)          # prev - x
+            s.add_(r["a"], alpha=-r["time_n"][step])     # prev - x1
+            s.mul_(r["w"])                               # err
+            r["a"].addcmul_(s, r["g_slices"][step], value=1.0 / self.num_steps)
+
     def _copy_rtc_prefix(self, prefix_len: int, stream: int = 0) -> None:
         if prefix_len <= 0:
             return
@@ -1494,6 +1651,10 @@ class Pi05Pipeline:
                     B["decoder_action_buf"].ptr.value,
                     W["decoder_action_out_proj_b"],
                     ds, ACTION_DIM, stream)
+                # RTC guidance reads diffusion_noise as x_k, so it must run
+                # after the bias add and before the residual accumulate.
+                if self._rtc is not None:
+                    self._apply_rtc_guidance(step, stream)
                 # noise += action_buf (weights pre-scaled by -1/num_steps by frontend)
                 fvk.residual_add(
                     B["diffusion_noise"].ptr.value,

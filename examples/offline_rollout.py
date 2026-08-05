@@ -9,12 +9,18 @@ offline simulation is faithful to what lerobot-rollout does live.
 Data flow per prediction:
   dataset frame
     ──► lerobot preprocessor  (normalizes state→16-dim, adds language tokens)
-    ──► extract for FlashRT   (images → 224×224 uint8, state → 16-dim numpy)
+    ──► extract for FlashRT   (images → 224×224 uint8, state → normalized numpy)
     ──► flash_rt.model.predict → (action_horizon, 32) normalized chunk
     ──► slice [:, :action_dim]  → (action_horizon, 16)
     ──► lerobot postprocessor  → (action_horizon, 16) joint-space actions
     ──► ActionQueue.merge()    → sliding window with inference-delay skip
     ──► ActionQueue.get() per frame → one action per dataset step
+
+RTC prefix guidance (``--rtc_guidance``, default on) forwards the queue's
+unexecuted tail and the measured inference delay into FlashRT, so each chunk is
+conditioned on its predecessor.  Run with ``--rtc_guidance=0`` to A/B it: the
+GT-error metrics barely move, but ``splice`` (the joint-space jump at each
+re-prediction boundary) is what guidance is actually there to fix.
 
 CLI equivalent:
     lerobot-rollout --inference.type=rtc
@@ -42,15 +48,30 @@ from pathlib import Path
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-_VIEW_KEYS = [
-    "observation.images.left_wrist",
-    "observation.images.right_wrist",
-    "observation.images.base",
-]
+from lerobot.policies.common.vla_utils import resize_with_pad_torch
+
+
+# ── Runtime tuning ────────────────────────────────────────────────────────────
+
+def configure_torch_threads(n: int) -> None:
+    """Cap the torch CPU thread pool for the rollout loop.
+
+    Call *after* the dataset is decoded so video decoding keeps the full pool.
+
+    NOTE: the online script's GPU-side observation prep is deliberately not
+    mirrored here — it exists to avoid a CPU ``uint8 -> float32`` expansion and
+    an HWC->CHW transpose that ``prepare_observation_for_inference`` does on the
+    host.  ``LeRobotDataset`` already hands back float32 CHW tensors, so this
+    harness's ``preprocess_frame`` is a straight H2D and measures 0.69 ms —
+    there is nothing to move to the GPU.
+    """
+    if n <= 0:
+        return
+    torch.set_num_threads(n)
+    print(f"  torch CPU threads: {torch.get_num_threads()}")
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
@@ -86,12 +107,33 @@ def parse_args():
     p.add_argument("--out_dir", default="./rollout_outputs")
     p.add_argument("--no_save", action="store_true")
     p.add_argument("--device", default="cuda")
+    p.add_argument("--rtc_guidance", type=int, default=1,
+                   help="1 = forward prev_chunk_left_over + inference_delay into "
+                        "FlashRT's RTC prefix guidance; 0 = independent chunks")
+    p.add_argument("--torch_threads", type=int, default=1,
+                   help="Cap the torch CPU thread pool during the rollout loop "
+                        "(0 = leave torch's default). Elementwise CPU work here "
+                        "is memory-bandwidth-bound and an unbounded pool both "
+                        "thrashes and adds jitter: measured 79.9 ms/tick at the "
+                        "default 20 threads vs 75.3 ms at 1. Applied after the "
+                        "dataset is decoded so loading stays parallel.")
+    p.add_argument("--requeue_threshold", type=int, default=-1,
+                   help="Re-predict once the queue drops to this many actions. "
+                        "-1 = execution_horizon. Must be < action_horizon. The "
+                        "real RTCInferenceEngine tops the queue up long before "
+                        "it drains (rtc_queue_threshold defaults to the chunk "
+                        "size), which is what leaves a leftover tail for the "
+                        "prefix to condition on.")
     return p.parse_args()
 
 
 # ── Setup ─────────────────────────────────────────────────────────────────────
 
-def load_policy_and_processors(ckpt: Path, action_horizon: int):
+def load_policy_and_processors(ckpt: Path, action_horizon: int, *,
+                               rtc_guidance: bool = True,
+                               execution_horizon: int = 12,
+                               prefix_attention_schedule: str = "EXP",
+                               max_guidance_weight: float = 10.0):
     """Load FlashRT model + lerobot pre/postprocessors from the same checkpoint."""
     import json
     import flash_rt
@@ -109,22 +151,44 @@ def load_policy_and_processors(ckpt: Path, action_horizon: int):
         raw.get("output_features", {}).get("action", {}).get("shape", [16])[0]
     )
 
+    # Camera view keys in the checkpoint's own (training) order, so the image
+    # list handed to FlashRT matches what the model was trained on instead of
+    # a hardcoded list that silently breaks on a different robot.
+    view_keys = [k for k, v in raw.get("input_features", {}).items()
+                 if v.get("type") == "VISUAL"]
+    if not view_keys:
+        raise RuntimeError("Checkpoint has no VISUAL input features")
+
     # Same preprocessor/postprocessor that lerobot-rollout loads
     preprocessor, postprocessor = make_pre_post_processors(
         config, pretrained_path=str(ckpt)
     )
 
+    # RTC prefix guidance has to be armed before graph capture — the
+    # correction is part of the captured denoise loop.
+    rtc_kwargs = {}
+    if rtc_guidance:
+        rtc_kwargs = {
+            "rtc_guidance": True,
+            "rtc_execution_horizon": execution_horizon,
+            "rtc_prefix_attention_schedule": prefix_attention_schedule.lower(),
+            "rtc_max_guidance_weight": max_guidance_weight,
+        }
+
     model = flash_rt.load_model(
         checkpoint=str(ckpt),
         framework="torch",
-        num_views=3,
+        num_views=len(view_keys),
         action_horizon=action_horizon,
         state_prompt_mode="fixed",
         autotune=3,
+        **rtc_kwargs,
     )
 
     print(f"  action_dim={action_dim}  action_horizon={action_horizon}")
-    return model, preprocessor, postprocessor, action_dim
+    print(f"  views={view_keys}")
+    print(f"  rtc_guidance={'on' if rtc_guidance else 'off'}")
+    return model, preprocessor, postprocessor, action_dim, view_keys
 
 
 def load_episode_frames(dataset_repo: str, episode_idx: int, max_frames: int):
@@ -145,28 +209,38 @@ def load_episode_frames(dataset_repo: str, episode_idx: int, max_frames: int):
 
 # ── Per-frame helpers ─────────────────────────────────────────────────────────
 
-def preprocess_frame(frame: dict, preprocessor, task: str, device: str) -> dict:
+def preprocess_frame(frame: dict, preprocessor, task: str, device: str,
+                     view_keys: list[str]) -> dict:
     """Build obs dict from a dataset frame and run lerobot's preprocessor."""
     obs = {}
-    for key in _VIEW_KEYS:
+    for key in view_keys:
         obs[key] = frame[key].unsqueeze(0).to(device)          # (1, C, H, W) float32
     obs["observation.state"] = frame["observation.state"].unsqueeze(0).to(device)  # (1, 16)
     obs["task"] = [task]
     return preprocessor(obs)
 
 
-def extract_flashrt_inputs(preprocessed: dict, device: str) -> tuple[list, np.ndarray]:
+def extract_flashrt_inputs(preprocessed: dict, view_keys: list[str]) -> tuple[list, np.ndarray]:
     """Extract uint8 images and normalized state for flash_rt.model.predict().
 
-    Images are resized to 224×224 here (FlashRT requires uniform size).
-    State is already normalized to the training distribution by the preprocessor.
+    The lerobot preprocessor does NOT resize — PI05 resizes inside
+    ``PI05Policy._preprocess_images`` with ``resize_with_pad_torch``
+    (aspect-preserving + centered black padding), which FlashRT bypasses.  We
+    apply the same resize here; a plain bilinear stretch would distort every
+    frame relative to training (a 1280×720 wrist camera has to become 224×126
+    with 49 px black bars, not a squashed square).
+
+    State is already normalized to the training distribution by the
+    preprocessor, which is what FlashRT's state-in-prompt discretizer expects.
     """
     imgs_uint8 = []
-    for key in _VIEW_KEYS:
-        img = preprocessed[key]                      # (1, C, H, W) float32 [0,1]
-        img = F.interpolate(img, size=(224, 224), mode="bilinear", align_corners=False)
-        hwc = img.squeeze(0).permute(1, 2, 0).clamp(0.0, 1.0)
-        imgs_uint8.append((hwc * 255).to(torch.uint8).cpu().numpy())
+    for key in view_keys:
+        img = resize_with_pad_torch(preprocessed[key], 224, 224)  # (1, C, 224, 224)
+        hwc = img.squeeze(0).permute(1, 2, 0)                     # (224, 224, C)
+        # round(), not truncate: values arrive as uint8/255, so x*255 lands at
+        # e.g. 199.99997 and a plain cast would bias every pixel down by 1 LSB.
+        imgs_uint8.append(
+            hwc.mul(255).round().clamp(0, 255).to(torch.uint8).cpu().numpy())
 
     state_np = preprocessed["observation.state"].squeeze(0).float().cpu().numpy()  # (16,)
     return imgs_uint8, state_np
@@ -180,6 +254,7 @@ def rtc_rollout(
     preprocessor,
     postprocessor,
     action_dim: int,
+    view_keys: list[str],
     task: str,
     fps: int,
     action_horizon: int,
@@ -187,18 +262,40 @@ def rtc_rollout(
     max_guidance_weight: float,
     prefix_attention_schedule: str,
     device: str,
+    rtc_guidance: bool = True,
+    requeue_threshold: int = -1,
 ) -> dict:
     """Simulate lerobot's RTC execution loop over dataset frames.
 
     Uses lerobot's ActionQueue and LatencyTracker directly so inference-delay
     compensation and prev_chunk_left_over handling match what lerobot-rollout does.
 
-    Re-predicts whenever the ActionQueue is empty (synchronous equivalent of the
-    background RTC thread firing when queue.qsize() drops below threshold).
+    Re-predicts once the queue drops to ``requeue_threshold`` actions, the
+    synchronous equivalent of the background RTC thread firing on
+    ``qsize() <= rtc_queue_threshold``.  This must trigger *before* the queue
+    drains: ``get_left_over()`` returns a zero-length tensor once it does, which
+    ``_normalize_prev_actions_length`` would zero-pad — and guiding toward an
+    all-zero prefix pulls the chunk toward zero actions rather than toward its
+    predecessor.
     """
-    from lerobot.policies.rtc import ActionQueue, LatencyTracker
+    from lerobot.policies.rtc import ActionQueue, LatencyTracker, reanchor_relative_rtc_prefix
     from lerobot.policies.rtc.configuration_rtc import RTCConfig, RTCAttentionSchedule
+    from lerobot.processor import NormalizerProcessorStep, RelativeActionsProcessorStep
     from lerobot.rollout.inference.rtc import _normalize_prev_actions_length
+
+    # Processor introspection for relative-action re-anchoring, mirroring
+    # RTCInferenceEngine.__init__. For a relative-action checkpoint the queue's
+    # leftover is stored in ABSOLUTE joint space, while the policy consumes
+    # actions relative to the *current* state — feeding the raw leftover in
+    # would guide toward a target expressed in the previous chunk's frame.
+    relative_step = next(
+        (s for s in preprocessor.steps
+         if isinstance(s, RelativeActionsProcessorStep) and s.enabled), None)
+    normalizer_step = next(
+        (s for s in preprocessor.steps
+         if isinstance(s, NormalizerProcessorStep)), None)
+    if relative_step is not None:
+        print("  relative actions: RTC prefix will be re-anchored per prediction")
 
     rtc_config = RTCConfig(
         enabled=True,
@@ -210,28 +307,63 @@ def rtc_rollout(
     latency_tracker = LatencyTracker()
     time_per_frame = 1.0 / fps
 
+    if requeue_threshold < 0:
+        requeue_threshold = execution_horizon
+    if requeue_threshold >= action_horizon:
+        raise ValueError(
+            f"requeue_threshold ({requeue_threshold}) must be < action_horizon "
+            f"({action_horizon}), otherwise the queue never falls below it and "
+            f"every frame re-predicts.")
+
     N = len(frames)
     predicted  = np.zeros((N, action_dim), dtype=np.float32)
     gt_actions = np.zeros((N, action_dim), dtype=np.float32)
     chunk_at: list[int] = []
     latencies_ms: list[float] = []
+    splice_jumps: list[float] = []
 
     print(f"\n  RTC | frames={N} exec_h={execution_horizon} "
-          f"act_h={action_horizon} guidance={max_guidance_weight} sched={prefix_attention_schedule}")
+          f"act_h={action_horizon} guidance={max_guidance_weight} sched={prefix_attention_schedule} "
+          f"prefix={'on' if rtc_guidance else 'off'}")
 
     for t in range(N):
         gt_actions[t] = frames[t]["action"].float().cpu().numpy()
 
-        # Re-predict when the queue runs dry (synchronous stand-in for the
-        # background RTC thread firing when qsize <= queue_threshold)
-        if queue.empty():
+        # Top the queue up before it drains (stand-in for the background RTC
+        # thread firing on qsize <= rtc_queue_threshold)
+        if queue.qsize() <= requeue_threshold:
             # ── Preprocess ────────────────────────────────────────────────
-            preprocessed = preprocess_frame(frames[t], preprocessor, task, device)
-            imgs, state_np = extract_flashrt_inputs(preprocessed, device)
+            preprocessed = preprocess_frame(frames[t], preprocessor, task, device, view_keys)
+            imgs, state_np = extract_flashrt_inputs(preprocessed, view_keys)
 
             # ── RTC bookkeeping (mirrors RTCInferenceEngine._rtc_loop) ────
             idx_before   = queue.get_action_index()
             prev_left    = queue.get_left_over()     # (remaining, action_dim) or None
+            # Joint-space action the robot is about to execute from the OLD
+            # chunk; compared against the new chunk's replacement below.
+            prev_exec    = queue.get_processed_left_over()
+
+            # A drained queue yields a zero-length leftover — treat that as "no
+            # previous chunk" rather than zero-padding it into a bogus target.
+            if prev_left is not None and prev_left.shape[0] == 0:
+                prev_left = None
+
+            # Re-anchor the leftover into the current relative frame. The
+            # preprocessor above just cached this frame's raw state, so this
+            # matches RTCInferenceEngine._rtc_loop exactly. Skipping it feeds the
+            # guidance a target from the previous chunk's coordinate frame, which
+            # makes guided rollouts markedly *worse* than unguided ones.
+            if prev_left is not None and relative_step is not None:
+                raw_state = relative_step.get_cached_state()
+                prev_abs = queue.get_processed_left_over()
+                if raw_state is not None and prev_abs is not None and prev_abs.numel() > 0:
+                    prev_left = reanchor_relative_rtc_prefix(
+                        prev_actions_absolute=prev_abs,
+                        current_state=raw_state,
+                        relative_step=relative_step,
+                        normalizer_step=normalizer_step,
+                        policy_device=device,
+                    )
 
             # Pad/truncate leftover to execution_horizon length for stable inference
             if prev_left is not None:
@@ -241,12 +373,20 @@ def rtc_rollout(
             max_lat = latency_tracker.max()
             delay   = math.ceil(max_lat / time_per_frame) if max_lat else 0
 
+            # prev_left is already in the same normalized space FlashRT returns
+            # (it is ActionQueue's `original` tensor), so it needs no conversion.
+            prev_np = None
+            if rtc_guidance and prev_left is not None:
+                prev_np = prev_left.float().cpu().numpy()
+
             # ── FlashRT inference ─────────────────────────────────────────
             t0 = time.perf_counter()
             chunk_norm = model.predict(           # (action_horizon, 32)
                 images=imgs,
                 prompt=task,
                 state=state_np,                   # already normalized by preprocessor
+                prev_actions=prev_np,
+                inference_delay=delay,
             )
             new_lat = time.perf_counter() - t0
             latencies_ms.append(new_lat * 1000.0)
@@ -263,6 +403,15 @@ def rtc_rollout(
             # while FlashRT was running) and resets the queue's read head
             queue.merge(chunk_16, chunk_post, new_delay, idx_before)
             chunk_at.append(t)
+
+            # Splice discontinuity: the joint-space step the robot sees at the
+            # handover from the old chunk to the new one. This is what prefix
+            # guidance exists to shrink; MAE-vs-GT barely registers it.
+            new_exec = queue.get_processed_left_over()
+            if (prev_exec is not None and prev_exec.shape[0] > 0
+                    and new_exec is not None and new_exec.shape[0] > 0):
+                splice_jumps.append(
+                    float((new_exec[0] - prev_exec[0]).abs().mean()))
 
             if len(chunk_at) <= 3 or len(chunk_at) % 20 == 0:
                 print(f"    t={t:4d}/{N}  predict #{len(chunk_at):3d}  "
@@ -285,6 +434,8 @@ def rtc_rollout(
         "chunk_at":          chunk_at,
         "latencies_ms":      lat,
         "rtc_config":        rtc_config,
+        "splice_jumps":      np.array(splice_jumps, dtype=np.float32),
+        "rtc_guidance":      rtc_guidance,
     }
 
 
@@ -297,15 +448,25 @@ def print_stats(results: dict, fps: int) -> None:
     nrm  = np.linalg.norm(pred, axis=1) * np.linalg.norm(gt, axis=1) + 1e-12
     cos  = np.einsum("nd,nd->n", pred, gt) / nrm
 
+    # Typical joint-space motion between adjacent timesteps — the scale a
+    # splice jump should be compared against.
+    step = np.abs(np.diff(pred, axis=0)).mean()
+    splice = results.get("splice_jumps", np.array([]))
+
     print(f"\n{'─'*55}")
     print("  Rollout statistics")
     print(f"{'─'*55}")
     print(f"  Frames:       {len(pred)} ({len(pred)/fps:.1f} s @ {fps} fps)")
     print(f"  Predictions:  {len(results['chunk_at'])}")
+    print(f"  RTC guidance: {'on' if results.get('rtc_guidance') else 'off'}")
     print(f"  MAE mean:     {err.mean():.4f}")
     print(f"  MAE per joint:{err.mean(axis=0).round(4)}")
     print(f"  Cosine mean:  {cos.mean():.4f}")
     print(f"  Cosine min:   {cos.min():.4f}")
+    print(f"  Step size:    {step:.4f}   (mean |Δaction| between frames)")
+    if splice.size:
+        print(f"  Splice mean:  {splice.mean():.4f}   ({splice.mean()/max(step,1e-9):.2f}x step size)")
+        print(f"  Splice max:   {splice.max():.4f}")
     print(f"  Lat median:   {np.median(results['latencies_ms']):.1f} ms")
     print(f"  Lat p99:      {np.percentile(results['latencies_ms'], 99):.1f} ms")
     print(f"{'─'*55}\n")
@@ -313,7 +474,8 @@ def print_stats(results: dict, fps: int) -> None:
 
 # ── Plotting ──────────────────────────────────────────────────────────────────
 
-def plot_results(results: dict, fps: int, out_dir: Path, episode: int) -> None:
+def plot_results(results: dict, fps: int, out_dir: Path, episode: int,
+                 tag: str = "") -> None:
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -351,11 +513,12 @@ def plot_results(results: dict, fps: int, out_dir: Path, episode: int) -> None:
     fig.suptitle(
         f"Offline RTC Rollout — ep{episode} | {N} frames @ {fps} fps | "
         f"{len(chunk_at)} predictions | exec_h={rtc.execution_horizon} "
-        f"guidance={rtc.max_guidance_weight}",
+        f"guidance={rtc.max_guidance_weight} | "
+        f"prefix={'on' if results.get('rtc_guidance') else 'off'}",
         fontsize=10,
     )
     fig.tight_layout(rect=[0, 0, 1, 0.96])
-    p = out_dir / f"ep{episode:03d}_per_joint.png"
+    p = out_dir / f"ep{episode:03d}{tag}_per_joint.png"
     fig.savefig(p, dpi=150); plt.close(fig)
     print(f"  Saved {p}")
 
@@ -380,7 +543,7 @@ def plot_results(results: dict, fps: int, out_dir: Path, episode: int) -> None:
     axes2[1].legend(fontsize=8)
     fig2.suptitle(f"Episode {episode} — Error & Latency", fontsize=11)
     fig2.tight_layout()
-    p2 = out_dir / f"ep{episode:03d}_error_latency.png"
+    p2 = out_dir / f"ep{episode:03d}{tag}_error_latency.png"
     fig2.savefig(p2, dpi=150); plt.close(fig2)
     print(f"  Saved {p2}")
 
@@ -396,7 +559,7 @@ def plot_results(results: dict, fps: int, out_dir: Path, episode: int) -> None:
                   f"exec_h={rtc.execution_horizon})")
     ax3.legend(fontsize=8)
     fig3.tight_layout()
-    p3 = out_dir / f"ep{episode:03d}_rtc_timeline.png"
+    p3 = out_dir / f"ep{episode:03d}{tag}_rtc_timeline.png"
     fig3.savefig(p3, dpi=150); plt.close(fig3)
     print(f"  Saved {p3}")
 
@@ -417,14 +580,22 @@ def main():
     print(f"  max_guidance:      {args.max_guidance_weight}")
     print(f"  sched:             {args.prefix_attention_schedule}")
     print(f"  action_horizon:    {args.action_horizon}")
+    print(f"  rtc_guidance:      {bool(args.rtc_guidance)}")
 
     print("\nLoading FlashRT + lerobot processors...")
-    model, preprocessor, postprocessor, action_dim = load_policy_and_processors(
-        ckpt, args.action_horizon
+    model, preprocessor, postprocessor, action_dim, view_keys = load_policy_and_processors(
+        ckpt, args.action_horizon,
+        rtc_guidance=bool(args.rtc_guidance),
+        execution_horizon=args.execution_horizon,
+        prefix_attention_schedule=args.prefix_attention_schedule,
+        max_guidance_weight=args.max_guidance_weight,
     )
 
     print("\nLoading dataset...")
     frames, fps = load_episode_frames(args.dataset, args.episode, args.max_frames)
+
+    # After decoding, so the dataset load keeps the full thread pool.
+    configure_torch_threads(args.torch_threads)
 
     print("\nRunning RTC rollout...")
     results = rtc_rollout(
@@ -433,6 +604,7 @@ def main():
         preprocessor=preprocessor,
         postprocessor=postprocessor,
         action_dim=action_dim,
+        view_keys=view_keys,
         task=args.task,
         fps=fps,
         action_horizon=args.action_horizon,
@@ -440,22 +612,29 @@ def main():
         max_guidance_weight=args.max_guidance_weight,
         prefix_attention_schedule=args.prefix_attention_schedule,
         device=args.device,
+        rtc_guidance=bool(args.rtc_guidance),
+        requeue_threshold=args.requeue_threshold,
     )
 
     print_stats(results, fps)
 
+    # Tag outputs so a guided/unguided A/B doesn't overwrite itself.
+    tag = "_guided" if args.rtc_guidance else "_unguided"
+
     if not args.no_save:
-        npz = out_dir / f"ep{args.episode:03d}_results.npz"
+        npz = out_dir / f"ep{args.episode:03d}{tag}_results.npz"
         np.savez(
             npz,
             predicted_actions=results["predicted_actions"],
             gt_actions=results["gt_actions"],
             chunk_at=np.array(results["chunk_at"]),
             latencies_ms=results["latencies_ms"],
+            splice_jumps=results["splice_jumps"],
+            rtc_guidance=np.array(bool(results["rtc_guidance"])),
         )
         print(f"  Saved {npz}")
         print("\nGenerating plots...")
-        plot_results(results, fps, out_dir, args.episode)
+        plot_results(results, fps, out_dir, args.episode, tag)
 
     print("\nDone.")
 

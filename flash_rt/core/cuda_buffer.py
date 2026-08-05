@@ -116,6 +116,55 @@ class CudaBuffer:
     def device_empty(cls, count: int, dtype) -> 'CudaBuffer':
         return cls.empty(count, dtype, managed=False)
 
+    def torch_view(self, shape, dtype):
+        """Alias this buffer's device memory as a torch tensor (no copy).
+
+        The tensor shares storage with the buffer, so writes through either
+        side are visible to the other.  Used where a pipeline needs a few
+        elementwise ops on a buffer that is otherwise driven by raw kernels;
+        the buffer must outlive the view.
+
+        ``torch`` is imported lazily so the JAX path never pulls it in.
+        """
+        import torch
+
+        # bfloat16 has no __cuda_array_interface__ typestr — alias the raw
+        # bytes as uint16 and reinterpret (same 2-byte width).
+        alias = torch.uint16 if dtype is torch.bfloat16 else dtype
+        typestr = {
+            torch.float32: "<f4",
+            torch.float16: "<f2",
+            torch.uint16: "<u2",
+            torch.int32: "<i4",
+            torch.uint8: "|u1",
+        }.get(alias)
+        if typestr is None:
+            raise TypeError(f"torch_view: unsupported dtype {dtype}")
+
+        shape = tuple(int(d) for d in shape)
+        count = 1
+        for d in shape:
+            count *= d
+        itemsize = 1 if typestr == "|u1" else int(typestr[-1])
+        if count * itemsize > self._nbytes:
+            raise ValueError(
+                f"torch_view: {shape} x {itemsize}B = {count * itemsize} bytes "
+                f"exceeds buffer size {self._nbytes}")
+
+        class _CudaArrayView:
+            __cuda_array_interface__ = None
+
+        holder = _CudaArrayView()
+        holder.__cuda_array_interface__ = {
+            "data": (int(self._ptr.value), False),
+            "shape": shape,
+            "typestr": typestr,
+            "strides": None,
+            "version": 3,
+        }
+        view = torch.as_tensor(holder, device="cuda")
+        return view.view(dtype) if alias is not dtype else view
+
     def upload(self, arr: np.ndarray):
         """Upload numpy → buffer."""
         assert arr.nbytes <= self._nbytes

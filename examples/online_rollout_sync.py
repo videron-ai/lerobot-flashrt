@@ -33,8 +33,8 @@ import os
 import sys
 import types
 
+import numpy as np
 import torch
-import torch.nn.functional as F
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -43,6 +43,8 @@ from lerobot.cameras.opencv import OpenCVCameraConfig       # noqa: F401
 from lerobot.cameras.realsense import RealSenseCameraConfig  # noqa: F401
 from lerobot.cameras.zmq import ZMQCameraConfig              # noqa: F401
 from lerobot.configs import FeatureType, parser
+from lerobot.policies.common.vla_utils import resize_with_pad_torch
+from lerobot.policies.utils import prepare_observation_for_inference
 from lerobot.robots import (                                  # noqa: F401
     Robot, RobotConfig,
     bi_openarm_follower, bi_rebot_b601_follower, bi_so_follower,
@@ -60,6 +62,7 @@ from lerobot.teleoperators import (                           # noqa: F401
     unitree_g1,
 )
 from lerobot.utils.constants import OBS_STATE
+from lerobot.utils.feature_utils import build_dataset_frame
 from lerobot.utils.import_utils import register_third_party_plugins
 from lerobot.utils.process import ProcessSignalHandler
 from lerobot.utils.utils import init_logging
@@ -67,25 +70,76 @@ from lerobot.utils.visualization_utils import init_visualization, shutdown_visua
 
 logger = logging.getLogger(__name__)
 
+# One-shot flag for the state-dimension mismatch warning.
+_state_dim_warned = False
 
-# ── FlashRT warmup ────────────────────────────────────────────────────────────
 
-def _warmup_flashrt(model, task: str, state_dim: int, num_views: int, n_iters: int = 20) -> None:
-    """Run n_iters dummy predict() calls to trigger CUDA graph capture.
+# ── Preprocessed batch → FlashRT inputs ───────────────────────────────────────
 
-    FlashRT captures a static CUDA graph on the first call (can take 1–60 s).
-    Warming up before the robot loop ensures that latency is paid upfront
-    rather than on the first live control tick.
+def _extract_flashrt_inputs(batch: dict, view_keys: list[str]) -> tuple[list, np.ndarray]:
+    """Convert a lerobot-preprocessed batch into FlashRT's predict() inputs.
+
+    Images: (1, C, H, W) float32 in [0, 1] → list of (224, 224, 3) uint8.
+
+    The lerobot preprocessor does NOT resize — PI05 resizes inside
+    ``PI05Policy._preprocess_images`` with ``resize_with_pad_torch``
+    (aspect-preserving + centered black padding), which FlashRT bypasses.
+    We therefore apply the *same* resize here.  A plain bilinear stretch
+    would distort every frame relative to training (e.g. a 1280×720 wrist
+    camera must become 224×126 with 49 px black bars, not a squashed square).
+
+    State: already normalized to [-1, 1] by NormalizerProcessorStep, which is
+    what FlashRT's state-in-prompt discretizer expects.
+
+    This helper is shared by warmup/calibration and the live control path so
+    FP8 activation scales are calibrated on exactly the tensors inference sees.
     """
-    import numpy as np
+    imgs = []
+    for key in view_keys:
+        img = resize_with_pad_torch(batch[key], 224, 224)        # (1, C, 224, 224)
+        hwc = img.squeeze(0).permute(1, 2, 0)                    # (224, 224, C)
+        # round(), not truncate: values arrive as uint8/255, so x*255 lands at
+        # e.g. 199.99997 and a plain cast would bias every pixel down by 1 LSB.
+        imgs.append(hwc.mul(255).round().clamp(0, 255).to(torch.uint8).cpu().numpy())
 
-    dummy_img   = np.zeros((224, 224, 3), dtype=np.uint8)
-    dummy_imgs  = [dummy_img] * num_views
-    dummy_state = np.zeros(state_dim, dtype=np.float32)
+    state_np = batch[OBS_STATE].squeeze(0).float().cpu().numpy()
+    return imgs, state_np
 
-    logger.info("Warming up FlashRT (%d iterations, %d views)...", n_iters, num_views)
+
+# ── FlashRT warmup / calibration ──────────────────────────────────────────────
+
+def _capture_warmup_inputs(ctx, cfg: RolloutConfig, task: str, view_keys: list[str]):
+    """Grab one real robot observation and push it through lerobot's preprocessor.
+
+    FlashRT freezes its FP8 activation scales on the first predict() call
+    (``VLAModel.predict`` → ``Pi05TorchFrontendRtx._calibrate_single_frame``),
+    and the RTX path does not persist that calibration to disk — it is redone
+    on every process start.  Calibrating on synthetic black frames would leave
+    every GEMM scaled for a degenerate input, so the warmup must run on a real
+    frame at the robot's actual operating point.
+    """
+    robot = ctx.hardware.robot_wrapper
+    obs = robot.get_observation()
+    obs_frame = build_dataset_frame(ctx.data.hw_features, obs, prefix="observation")
+    obs_batch = prepare_observation_for_inference(
+        obs_frame, cfg.device, task, robot.robot_type
+    )
+    obs_batch["task"] = [task]
+    preprocessed = ctx.policy.preprocessor(obs_batch)
+    return _extract_flashrt_inputs(preprocessed, view_keys)
+
+
+def _warmup_flashrt(model, task: str, imgs: list, state, n_iters: int = 20) -> None:
+    """Run n_iters predict() calls on a real observation.
+
+    The first call performs FP8 activation calibration and static CUDA graph
+    capture (1–60 s); the rest exercise the replay path.  Doing this before the
+    robot loop means that cost is paid upfront rather than on the first live
+    control tick.
+    """
+    logger.info("Warming up FlashRT (%d iterations, %d views)...", n_iters, len(imgs))
     for i in range(n_iters):
-        model.predict(images=dummy_imgs, prompt=task, state=dummy_state)
+        model.predict(images=imgs, prompt=task, state=state)
         if (i + 1) % 5 == 0:
             logger.info("  warmup %d/%d", i + 1, n_iters)
     torch.cuda.synchronize()
@@ -151,8 +205,16 @@ def _install_flashrt_backend(ctx, cfg: RolloutConfig) -> None:
             "Policy has no VISUAL input features — cannot determine camera view keys."
         )
 
-    # state_in_prompt_dim must match what PI05PrepareStateTokenizerProcessorStep produces.
-    state_dim = action_dim
+    # state_in_prompt_dim must match what Pi05PrepareStateTokenizerProcessorStep
+    # produces.  Read it from the checkpoint rather than assuming
+    # state_dim == action_dim — robots with velocity channels (e.g. LeKiwi) have
+    # a wider state than action.
+    state_feature = policy.config.input_features.get(OBS_STATE)
+    if state_feature is None:
+        raise RuntimeError(
+            f"Policy has no '{OBS_STATE}' input feature — cannot determine state dim."
+        )
+    state_dim = state_feature.shape[0]
 
     logger.info(
         "Loading FlashRT model | ckpt=%s  action_dim=%d  chunk=%d  views=%s",
@@ -167,7 +229,11 @@ def _install_flashrt_backend(ctx, cfg: RolloutConfig) -> None:
         autotune=3,
     )
 
-    _warmup_flashrt(flash_model, task, state_dim, num_views=len(view_keys), n_iters=20)
+    # Warmup on a real observation: the first predict() call freezes FlashRT's
+    # FP8 activation scales and captures the CUDA graph, so it must see a frame
+    # from the robot's actual operating point (see _capture_warmup_inputs).
+    warm_imgs, warm_state = _capture_warmup_inputs(ctx, cfg, task, view_keys)
+    _warmup_flashrt(flash_model, task, warm_imgs, warm_state, n_iters=20)
 
     # Close over everything the patched method needs.
     _model     = flash_model
@@ -186,25 +252,27 @@ def _install_flashrt_backend(ctx, cfg: RolloutConfig) -> None:
         Returns:
             Tensor shape (1, chunk_size, action_dim) float32, normalized.
         """
-        # Images: (1, C, H, W) float32 [0,1] — lerobot preprocessor already resizes
-        # to 224×224, but interpolate is kept as a safety net for raw-resolution inputs.
-        imgs = []
-        for key in _views:
-            img = batch[key]
-            if img.shape[-2:] != (224, 224):
-                img = F.interpolate(img, size=(224, 224), mode="bilinear", align_corners=False)
-            hwc = img.squeeze(0).permute(1, 2, 0).clamp(0.0, 1.0)
-            imgs.append((hwc * 255).to(torch.uint8).cpu().numpy())
+        global _state_dim_warned
 
-        # State: already normalized by lerobot's preprocessor → (state_dim,) numpy
-        state_np = batch[OBS_STATE].squeeze(0).float().cpu().numpy()
+        # Resize + uint8 exactly as the warmup/calibration frame was prepared.
+        imgs, state_np = _extract_flashrt_inputs(batch, _views)
+
+        # The full state goes into the prompt — truncating it would produce a
+        # token sequence the checkpoint was never trained on.
+        if not _state_dim_warned and state_np.shape[0] != _state_dim:
+            logger.warning(
+                "Runtime state dim (%d) differs from the checkpoint's declared %s dim (%d); "
+                "the state-in-prompt tokens will not match training.",
+                state_np.shape[0], OBS_STATE, _state_dim,
+            )
+            _state_dim_warned = True
 
         # FlashRT inference — returns (chunk_size, 32) normalized actions
         with torch.no_grad():
             chunk_np = _model.predict(
                 images=imgs,
                 prompt=_task,
-                state=state_np[:_state_dim],
+                state=state_np,
             )
 
         # Slice to action_dim, return (1, T, action_dim) on target device

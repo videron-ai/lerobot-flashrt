@@ -27,6 +27,7 @@ download command spelled out — no hidden failure modes.
 """
 from __future__ import annotations
 
+import functools
 import os
 from pathlib import Path
 from typing import Optional
@@ -118,13 +119,16 @@ def resolve_paligemma_tokenizer_path() -> str:
     raise FileNotFoundError(_format_help_message(probed))
 
 
-def load_paligemma_sentencepiece():
-    """Return a loaded `sentencepiece.SentencePieceProcessor` for the
-    PaliGemma model. Raises FileNotFoundError with a helpful download
-    command if the model file can't be located.
+@functools.lru_cache(maxsize=4)
+def _load_paligemma_sentencepiece_cached(path: str):
+    """Load and cache one processor per resolved model path.
+
+    Loading the ~4 MB SentencePiece model costs ~40 ms.  Pi0.5 renders robot
+    state into the prompt, so ``set_prompt`` — and therefore ``_embed_prompt``
+    — runs on *every* inference; without this cache that reload lands on the
+    hot control path once per control tick.
     """
     import sentencepiece as spm
-    path = resolve_paligemma_tokenizer_path()
     sp = spm.SentencePieceProcessor()
     if not sp.Load(path):
         raise RuntimeError(
@@ -133,3 +137,14 @@ def load_paligemma_sentencepiece():
             f"  curl -L {_DOWNLOAD_URL} -o {path}"
         )
     return sp
+
+
+def load_paligemma_sentencepiece():
+    """Return a loaded `sentencepiece.SentencePieceProcessor` for the
+    PaliGemma model. Raises FileNotFoundError with a helpful download
+    command if the model file can't be located.
+
+    The processor is cached per resolved path; ``SentencePieceProcessor`` is
+    read-only once loaded, so sharing one instance across callers is safe.
+    """
+    return _load_paligemma_sentencepiece_cached(resolve_paligemma_tokenizer_path())

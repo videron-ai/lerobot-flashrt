@@ -472,7 +472,11 @@ class Pi05TorchFrontendRtx:
                  use_fp8: bool = True,
                  hardware: Optional[str] = None,
                  fp8_layout: Optional[str] = None,
-                 state_prompt_mode: str = "exact"):
+                 state_prompt_mode: str = "exact",
+                 rtc_guidance: bool = False,
+                 rtc_execution_horizon: int = 10,
+                 rtc_prefix_attention_schedule: str = "exp",
+                 rtc_max_guidance_weight: float = 10.0):
         checkpoint_dir = pathlib.Path(checkpoint_dir)
         # State-in-prompt graph strategy (Pi0.5 renders robot state into the
         # prompt, so its token length drifts with the state values):
@@ -508,6 +512,23 @@ class Pi05TorchFrontendRtx:
         if self._cache_frames < 1:
             raise ValueError(f"cache_frames must be >= 1, got {self._cache_frames}")
         self._frame_count = 0
+        # RTC prefix guidance. Opt-in: arming it adds elementwise correction
+        # kernels to the captured denoise loop, so leaving it off keeps the
+        # default graph and its numerics untouched.
+        from flash_rt.core.utils.rtc_guidance import PREFIX_ATTENTION_SCHEDULES
+        self._rtc_guidance = bool(rtc_guidance)
+        sched = str(rtc_prefix_attention_schedule).lower()
+        if sched not in PREFIX_ATTENTION_SCHEDULES:
+            raise ValueError(
+                f"rtc_prefix_attention_schedule must be one of "
+                f"{PREFIX_ATTENTION_SCHEDULES}, got {rtc_prefix_attention_schedule!r}")
+        self._rtc_schedule = sched
+        self._rtc_execution_horizon = int(rtc_execution_horizon)
+        if self._rtc_guidance and not 0 < self._rtc_execution_horizon <= int(chunk_size):
+            raise ValueError(
+                f"rtc_execution_horizon must be in (0, chunk_size={chunk_size}], "
+                f"got {self._rtc_execution_horizon}")
+        self._rtc_max_guidance_weight = float(rtc_max_guidance_weight)
         from flash_rt.models.pi05.pipeline_rtx import VIS_L as _VIS_L
         self._vision_num_layers = _VIS_L if vision_num_layers is None else int(vision_num_layers)
         if not 1 <= self._vision_num_layers <= _VIS_L:
@@ -1071,6 +1092,8 @@ class Pi05TorchFrontendRtx:
                 vision_num_layers=self._vision_num_layers,
                 fixed_shape=True,
                 **self._pipeline_precision_kwargs())
+            if self._rtc_guidance:
+                self._fixed_pipeline.enable_rtc_guidance()
             if self._fixed_pipeline.use_int8_vision_static:
                 self._fixed_pipeline.vis_int8_static_calibrated = False
                 self._fixed_pipeline.vis_int8_static_scales = {}
@@ -1121,6 +1144,8 @@ class Pi05TorchFrontendRtx:
                     vision_pool_factor=self._vision_pool_factor,
                     vision_num_layers=self._vision_num_layers,
                     **self._pipeline_precision_kwargs())
+                if self._rtc_guidance:
+                    self.pipeline.enable_rtc_guidance()
                 self._prompt_pipeline_cache[prompt_len] = self.pipeline
                 # Static INT8 vision scales are per-pipeline-instance.
                 if self.pipeline.use_int8_vision_static:
@@ -1543,8 +1568,49 @@ class Pi05TorchFrontendRtx:
         """:class:`ModelPrecisionSpec` captured at calibration time."""
         return getattr(self, "_precision_spec", None)
 
-    def infer(self, observation: dict, debug: bool = False) -> dict:
+    def _stage_rtc_inputs(self, prev_actions, inference_delay: int) -> None:
+        """Write this inference's RTC prefix-guidance inputs into the pipeline.
+
+        Prefix weights are recomputed on the host every call, so a varying
+        ``inference_delay`` costs one 4*chunk-byte upload — never a recapture.
+        With ``prev_actions=None`` the weights are zeroed and the captured
+        correction evaluates to exactly zero.
+        """
+        from flash_rt.core.utils.rtc_guidance import get_prefix_weights
+
+        if not getattr(self.pipeline, "rtc_guidance_enabled", False):
+            raise RuntimeError(
+                f"{type(self.pipeline).__name__} was not armed for RTC prefix "
+                "guidance. RL/CFG and batched pipelines do not support it; use "
+                "the standard single-sample path.")
+
+        if prev_actions is None:
+            self.pipeline.rtc_write_inputs(
+                None, None, self._rtc_max_guidance_weight)
+            return
+
+        prev = np.asarray(prev_actions, dtype=np.float32)
+        if prev.ndim != 2:
+            raise ValueError(
+                f"prev_actions must be 2-D (T, action_dim), got {prev.shape}")
+        # A leftover tail shorter than the execution horizon has nothing to
+        # merge past its own length (mirrors RTCProcessor.denoise_step).
+        horizon = min(self._rtc_execution_horizon, prev.shape[0])
+        weights = get_prefix_weights(
+            int(inference_delay), horizon, self.chunk_size, self._rtc_schedule)
+        self.pipeline.rtc_write_inputs(
+            prev, weights, self._rtc_max_guidance_weight)
+
+    def infer(self, observation: dict, debug: bool = False,
+              prev_actions=None, inference_delay: int = 0) -> dict:
         """Run inference on a single observation.
+
+        Args:
+            prev_actions: RTC previous-chunk tail, ``(T, action_dim)`` in raw
+                model (normalized) space, or None. Requires the frontend to
+                have been built with ``rtc_guidance=True``.
+            inference_delay: timesteps the robot consumed while the previous
+                inference was running; pins that many prefix weights to 1.0.
 
         All GPU work happens on ``self._graph_torch_stream`` — the same
         stream the graph was captured on — so replay + pre/post D2D copies
@@ -1562,7 +1628,17 @@ class Pi05TorchFrontendRtx:
             raise RuntimeError("set_prompt must be called before infer")
 
         if isinstance(self.pipeline, Pi05CFGBatchedPipeline):
+            if prev_actions is not None:
+                raise RuntimeError(
+                    "RTC prefix guidance is not supported on the batched CFG "
+                    "pipeline.")
             return self._infer_cfg_batched(observation, debug=debug)
+
+        if not self._rtc_guidance and prev_actions is not None:
+            raise RuntimeError(
+                "prev_actions requires rtc_guidance=True at load_model() time — "
+                "the guidance correction has to be present when the CUDA graph "
+                "is captured.")
 
         t0 = time.perf_counter()
 
@@ -1576,6 +1652,11 @@ class Pi05TorchFrontendRtx:
 
         with torch.cuda.stream(self._graph_torch_stream):
             stream_int = self._graph_torch_stream.cuda_stream
+
+            # Must be staged on the graph stream so the uploads are ordered
+            # ahead of the replay that reads them.
+            if self._rtc_guidance:
+                self._stage_rtc_inputs(prev_actions, inference_delay)
 
             self._noise_buf.normal_()
             self._copy_tensor_to_pipeline_buf_stream(
