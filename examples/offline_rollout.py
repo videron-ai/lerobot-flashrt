@@ -107,6 +107,20 @@ def parse_args():
     p.add_argument("--out_dir", default="./rollout_outputs")
     p.add_argument("--no_save", action="store_true")
     p.add_argument("--device", default="cuda")
+    p.add_argument("--precision", default="fp8", choices=["fp8", "fp16"],
+                   help="FlashRT numeric path. 'fp16' is the non-quantized "
+                        "path: measured 18.7% lower mean per-joint MAE than "
+                        "fp8, concentrated in the gripper joints, at the cost "
+                        "of exact-length prompt graphs.")
+    p.add_argument("--calib_frames", type=int, default=1,
+                   help="FP8 activation-scale calibration samples, spread "
+                        "evenly across the episode. 1 (default) keeps the "
+                        "stock lazy behaviour: scales frozen on frame 0, the "
+                        "start pose. Higher values cover the approach and "
+                        "grasp, where the scene differs most from frame 0.")
+    p.add_argument("--calib_percentile", type=float, default=99.9,
+                   help="Percentile for multi-sample amax reduction "
+                        "(100.0 = plain max). Only used when calib_frames > 1.")
     p.add_argument("--rtc_guidance", type=int, default=1,
                    help="1 = forward prev_chunk_left_over + inference_delay into "
                         "FlashRT's RTC prefix guidance; 0 = independent chunks")
@@ -133,8 +147,16 @@ def load_policy_and_processors(ckpt: Path, action_horizon: int, *,
                                rtc_guidance: bool = True,
                                execution_horizon: int = 12,
                                prefix_attention_schedule: str = "EXP",
-                               max_guidance_weight: float = 10.0):
-    """Load FlashRT model + lerobot pre/postprocessors from the same checkpoint."""
+                               max_guidance_weight: float = 10.0,
+                               precision: str = "fp8"):
+    """Load FlashRT model + lerobot pre/postprocessors from the same checkpoint.
+
+    ``precision="fp16"`` selects FlashRT's non-quantized full-FP16 path.  It
+    supports RTC prefix guidance like the FP8 default, but takes no
+    ``state_prompt_mode`` (``load_model`` drops the kwarg rather than erroring,
+    so the graph tracks the exact prompt length instead of running one padded
+    graph, and recaptures when that length changes).
+    """
     import json
     import flash_rt
     from lerobot.policies import make_pre_post_processors
@@ -175,6 +197,12 @@ def load_policy_and_processors(ckpt: Path, action_horizon: int, *,
             "rtc_max_guidance_weight": max_guidance_weight,
         }
 
+    if precision not in ("fp8", "fp16"):
+        raise ValueError(f"precision must be 'fp8' or 'fp16', got {precision!r}")
+    precision_kwargs = (
+        {"use_fp16": True, "use_fp8": False} if precision == "fp16" else {}
+    )
+
     model = flash_rt.load_model(
         checkpoint=str(ckpt),
         framework="torch",
@@ -182,11 +210,13 @@ def load_policy_and_processors(ckpt: Path, action_horizon: int, *,
         action_horizon=action_horizon,
         state_prompt_mode="fixed",
         autotune=3,
+        **precision_kwargs,
         **rtc_kwargs,
     )
 
     print(f"  action_dim={action_dim}  action_horizon={action_horizon}")
     print(f"  views={view_keys}")
+    print(f"  precision={precision}")
     print(f"  rtc_guidance={'on' if rtc_guidance else 'off'}")
     return model, preprocessor, postprocessor, action_dim, view_keys
 
@@ -248,6 +278,47 @@ def extract_flashrt_inputs(preprocessed: dict, view_keys: list[str]) -> tuple[li
 
 # ── RTC rollout ───────────────────────────────────────────────────────────────
 
+def calibrate_over_episode(model, frames, preprocessor, task, device, view_keys,
+                           *, n_samples: int, percentile: float) -> None:
+    """Freeze FP8 activation scales over frames spanning the whole episode.
+
+    FlashRT calibrates lazily on the first ``predict()``, which in this script
+    is frame 0 — the start pose, grippers pointed down and nowhere near the
+    table.  Those scales then have to cover every later frame, including the
+    approach and grasp, where the scene looks nothing like frame 0.  That is
+    the leading explanation for the FP8-vs-FP16 gap being concentrated in the
+    gripper joints (joint 7: 8.144 vs 4.615 MAE), since FP16 does no
+    quantization and therefore has no calibration frame to be wrong about.
+
+    Sampling evenly across the episode and reducing per-sample amax with a
+    percentile gives the scales a view of the actual operating range.  A
+    percentile below 100 also clips one-off activation spikes that would
+    otherwise stretch every scale to cover a single outlier frame.
+
+    No-op for the FP16 path, which has no activation scales to freeze.
+    """
+    idxs = sorted({int(i) for i in
+                   np.linspace(0, len(frames) - 1, num=n_samples, dtype=int)})
+    obs_list = []
+    for i in idxs:
+        pre = preprocess_frame(frames[i], preprocessor, task, device, view_keys)
+        imgs, state_np = extract_flashrt_inputs(pre, view_keys)
+        obs = {"images": list(imgs), "image": imgs[0], "state": state_np}
+        if len(imgs) >= 2:
+            obs["wrist_image"] = imgs[1]
+        if len(imgs) >= 3:
+            obs["wrist_image_right"] = imgs[2]
+        obs_list.append(obs)
+
+    # calibrate() requires a prompt to have been set. Use the first sample's
+    # state so the state-in-prompt tokens match what inference will produce.
+    model.set_prompt(task, state=obs_list[0]["state"])
+    shown = ", ".join(str(i) for i in idxs[:6])
+    print(f"  calibrating on {len(obs_list)} frames "
+          f"[{shown}{', ...' if len(idxs) > 6 else ''}] percentile={percentile}")
+    model.calibrate(obs_list, percentile=percentile, verbose=True)
+
+
 def rtc_rollout(
     frames: list[dict],
     model,
@@ -264,6 +335,8 @@ def rtc_rollout(
     device: str,
     rtc_guidance: bool = True,
     requeue_threshold: int = -1,
+    calib_frames: int = 1,
+    calib_percentile: float = 99.9,
 ) -> dict:
     """Simulate lerobot's RTC execution loop over dataset frames.
 
@@ -321,6 +394,12 @@ def rtc_rollout(
     chunk_at: list[int] = []
     latencies_ms: list[float] = []
     splice_jumps: list[float] = []
+
+    if calib_frames > 1:
+        calibrate_over_episode(
+            model, frames, preprocessor, task, device, view_keys,
+            n_samples=calib_frames, percentile=calib_percentile,
+        )
 
     print(f"\n  RTC | frames={N} exec_h={execution_horizon} "
           f"act_h={action_horizon} guidance={max_guidance_weight} sched={prefix_attention_schedule} "
@@ -381,12 +460,19 @@ def rtc_rollout(
 
             # ── FlashRT inference ─────────────────────────────────────────
             t0 = time.perf_counter()
+            # ``delay`` still drives the ActionQueue merge offset below; it is
+            # only withheld from predict() when guidance is off, where the
+            # frontend ignores it anyway (``pi05_rtx.py`` stages RTC inputs
+            # solely under ``if self._rtc_guidance``).  Passing it
+            # unconditionally makes ``api.predict`` take its RTC branch, which
+            # hard-fails on frontends without a ``prev_actions`` parameter —
+            # notably the FP16 reference path.
             chunk_norm = model.predict(           # (action_horizon, 32)
                 images=imgs,
                 prompt=task,
                 state=state_np,                   # already normalized by preprocessor
                 prev_actions=prev_np,
-                inference_delay=delay,
+                inference_delay=delay if rtc_guidance else 0,
             )
             new_lat = time.perf_counter() - t0
             latencies_ms.append(new_lat * 1000.0)
@@ -495,7 +581,7 @@ def plot_results(results: dict, fps: int, out_dir: Path, episode: int,
     for j in range(D):
         ax = axes[j]
         ax.plot(t_axis, gt[:, j],   color="#2196F3", lw=1.2, alpha=0.9)
-        ax.plot(t_axis, pred[:, j], color="#FF5722", lw=1.0, alpha=0.9, linestyle="--")
+        ax.plot(t_axis, pred[:, j], color="#FF5722", lw=1.0, alpha=0.9)
         for ca in chunk_at:
             ax.axvline(ca / fps, color="#4CAF50", lw=0.4, alpha=0.4)
         ax.set_title(f"joint {j}", fontsize=8, pad=2)
@@ -551,7 +637,7 @@ def plot_results(results: dict, fps: int, out_dir: Path, episode: int,
     fig3, ax3 = plt.subplots(figsize=(16, 3))
     ax3.plot(t_axis, gt[:, :8].mean(1),   color="#2196F3", lw=1.0, label="GT mean j0-7")
     ax3.plot(t_axis, pred[:, :8].mean(1), color="#FF5722", lw=1.0,
-             linestyle="--", label="FlashRT mean j0-7")
+             label="FlashRT mean j0-7")
     for ca in chunk_at:
         ax3.axvline(ca / fps, color="#4CAF50", lw=0.8, alpha=0.55)
     ax3.set_xlabel("time (s)"); ax3.set_ylabel("mean action value")
@@ -580,6 +666,7 @@ def main():
     print(f"  max_guidance:      {args.max_guidance_weight}")
     print(f"  sched:             {args.prefix_attention_schedule}")
     print(f"  action_horizon:    {args.action_horizon}")
+    print(f"  precision:         {args.precision}")
     print(f"  rtc_guidance:      {bool(args.rtc_guidance)}")
 
     print("\nLoading FlashRT + lerobot processors...")
@@ -589,6 +676,7 @@ def main():
         execution_horizon=args.execution_horizon,
         prefix_attention_schedule=args.prefix_attention_schedule,
         max_guidance_weight=args.max_guidance_weight,
+        precision=args.precision,
     )
 
     print("\nLoading dataset...")
@@ -614,6 +702,8 @@ def main():
         device=args.device,
         rtc_guidance=bool(args.rtc_guidance),
         requeue_threshold=args.requeue_threshold,
+        calib_frames=args.calib_frames,
+        calib_percentile=args.calib_percentile,
     )
 
     print_stats(results, fps)

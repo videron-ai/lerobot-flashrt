@@ -26,7 +26,10 @@ Usage:
         --duration=0
 """
 
-from __future__ import annotations
+# NOTE: no ``from __future__ import annotations`` here. ``lerobot``'s
+# ``parser.wrap`` reads the raw ``__annotations__`` of ``rollout`` to find the
+# config class; under PEP 563 it would get the string ``"RolloutConfig"`` and
+# draccus would fail with "must be called with a dataclass type or instance".
 
 import logging
 import os
