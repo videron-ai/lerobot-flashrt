@@ -332,6 +332,114 @@ def _install_throttled_telemetry() -> None:
     logger.info("Installed throttled telemetry (images at policy rate)")
 
 
+def _install_episode_engine_pause() -> None:
+    """Pause the inference engine the moment a recording episode ends.
+
+    ``EpisodicStrategy`` calls ``self._engine.resume()`` at the start of every
+    episode (``episodic.py``) and never calls ``pause()`` anywhere — only
+    ``dagger.py`` does.  So from the first episode onward the RTC thread keeps
+    inferring continuously through the reset phase, ``save_episode()``, video
+    encoding and the hub upload, stopping only at ``engine.stop()`` in
+    teardown.
+
+    Measured on a 10 s episode: the thread ran for ~40 s, ~19 s of it
+    overlapping SVT-AV1 encoding and a 58 MB upload — GPU and CPU contention
+    at exactly the point the dataset is being written, and it hands
+    ``stop()`` a thread that is mid-inference to join.
+
+    ``pause()`` only clears the engine's ``_policy_active`` event, dropping the
+    thread into its idle sleep, and the ``resume()`` already present at the
+    next episode start undoes it.  Nothing to unwind, so wrapping
+    ``_policy_loop`` is enough.
+
+    Set ``FLASHRT_EPISODE_PAUSE=0`` to keep lerobot's stock behaviour.
+    """
+    if os.environ.get("FLASHRT_EPISODE_PAUSE", "1") == "0":
+        logger.info("Episode-end engine pause disabled via FLASHRT_EPISODE_PAUSE=0")
+        return
+
+    from lerobot.rollout.strategies.episodic import EpisodicStrategy
+
+    original = EpisodicStrategy._policy_loop
+    if getattr(original, "_flashrt_episode_pause", False):
+        return
+
+    @wraps(original)
+    def policy_loop_then_pause(self, *args, **kwargs):
+        try:
+            return original(self, *args, **kwargs)
+        finally:
+            # In `finally`, not after the call: an episode aborted by an
+            # exception or by the shutdown event must not leave the thread
+            # inferring into teardown either.
+            engine = getattr(self, "_engine", None)
+            if engine is not None:
+                engine.pause()
+
+    policy_loop_then_pause._flashrt_episode_pause = True
+    EpisodicStrategy._policy_loop = policy_loop_then_pause
+    logger.info("Installed episode-end inference pause (EpisodicStrategy)")
+
+
+def _install_record_decimation(ctx, cfg: RolloutConfig) -> None:
+    """Record one dataset frame per camera frame, not per control tick.
+
+    ``--interpolation_multiplier=N`` raises the control loop to ``fps * N``
+    (``ActionInterpolator.get_control_interval`` returns ``1/(fps*N)``) so the
+    arm gets smoothed commands, while the policy is still consumed at ``fps``
+    — the interpolator buffers N blends and only pulls a new action when that
+    buffer empties.  That part is correct.  The recording is not: the strategy
+    writes a dataset frame on *every* control tick, but the dataset is created
+    with ``cfg.dataset.fps`` (``rollout/context.py``), and nothing reconciles
+    the two.
+
+    With ``fps=30, N=3`` against 30 fps cameras that gives a 10 s episode 881
+    frames declared at 30 fps — 29 s of playback, where 2 of every 3 frames are
+    the same camera capture, and the image writer does 3x the work *during* the
+    episode.
+
+    Forwarding only every Nth ``add_frame`` keeps the dataset at the camera
+    rate while control stays at ``fps * N``.  Decimation is uniform rather than
+    aligned to the interpolator's policy-action boundary, because regular
+    spacing is what a fixed ``dataset.fps`` actually claims; each kept frame
+    still pairs the observation of that tick with the action sent on it.
+
+    Set ``FLASHRT_RECORD_DECIMATE=0`` to record every tick.
+    """
+    n = int(getattr(cfg, "interpolation_multiplier", 1) or 1)
+    if n <= 1:
+        return
+    if os.environ.get("FLASHRT_RECORD_DECIMATE", "1") == "0":
+        logger.info("Record decimation disabled via FLASHRT_RECORD_DECIMATE=0")
+        return
+
+    dataset = getattr(getattr(ctx, "data", None), "dataset", None)
+    if dataset is None:
+        return          # strategy records nothing (e.g. base)
+
+    original = dataset.add_frame
+    if getattr(original, "_flashrt_decimated", False):
+        return
+
+    state = {"tick": 0}
+
+    @wraps(original)
+    def decimated_add_frame(*args, **kwargs):
+        tick = state["tick"]
+        state["tick"] = tick + 1
+        if tick % n:
+            return None
+        return original(*args, **kwargs)
+
+    decimated_add_frame._flashrt_decimated = True
+    dataset.add_frame = decimated_add_frame
+    logger.info(
+        "Recording 1 frame per %d control ticks (interpolation_multiplier=%d): "
+        "control %.0f Hz, dataset %.0f Hz",
+        n, n, cfg.fps * n, cfg.fps,
+    )
+
+
 def _configure_torch_threads() -> None:
     """Bound the torch CPU thread pool for the control loop.
 
@@ -808,6 +916,7 @@ def rollout(cfg: RolloutConfig):
     _install_fast_observation_prep()
     _install_fast_policy_load()
     _install_throttled_telemetry()
+    _install_episode_engine_pause()
 
     if cfg.display_data:
         logger.info(
@@ -833,6 +942,10 @@ def rollout(cfg: RolloutConfig):
     # disconnected — even if FlashRT load or strategy creation fails.
     strategy = None
     try:
+        # Keep the dataset at the camera rate when interpolation raises the
+        # control rate. Must happen before the strategy starts recording.
+        _install_record_decimation(ctx, cfg)
+
         # Swap in FlashRT as the policy inference backend.
         # Must happen before strategy.setup() starts the RTC thread.
         _install_flashrt_backend(ctx, cfg)
