@@ -4,6 +4,28 @@
 
 # FlashRT
 
+> [!IMPORTANT]
+> **lerobot-flashrt: check out the `lerobot` submodule.** `lerobot/` is a
+> git submodule (huggingface/lerobot, pinned). A plain `git clone` leaves it
+> empty, and both `docker build` and `scripts/run_rollout_container.sh`
+> stop with an error until it's populated.
+>
+> ```bash
+> git clone --recurse-submodules https://github.com/videron-ai/lerobot-flashrt.git
+> # or, in an existing clone (also after a pull that moves the pin):
+> git submodule update --init
+> ```
+>
+> Then build and start the rollout container:
+>
+> ```bash
+> docker build -t lerobot_flashrt:1.0 -f docker/Dockerfile .
+> bash scripts/run_rollout_container.sh
+> ```
+>
+> `git config submodule.recurse true` makes `git pull` / `git checkout`
+> update the submodule automatically.
+
 **FlashRT is a high-performance realtime inference engine for small-batch, latency-sensitive AI workloads.**
 
 <p align="center">

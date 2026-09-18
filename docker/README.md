@@ -31,6 +31,16 @@ Flash-Attention 2, so its image deliberately does NOT produce
 > NGC base image, and the produced `.so` files match what the
 > registry image will eventually ship.
 
+> **lerobot-flashrt: populate the `lerobot` submodule first.** The
+> Dockerfile copies `lerobot/` into the image and installs it; an empty
+> submodule fails the build with a pointer back here.
+>
+> ```bash
+> git submodule update --init    # or clone with --recurse-submodules
+> docker build -t lerobot_flashrt:1.0 -f docker/Dockerfile .
+> bash scripts/run_rollout_container.sh   # rollout container (cameras, mounts)
+> ```
+
 Build the image yourself when you want to pin a specific commit,
 target a different GPU than the build host, or modify the kernels:
 
