@@ -92,6 +92,52 @@ from flash_rt import flash_rt_kernels, flash_rt_fa2; \
 assert callable(flash_rt_fa2.fwd_bf16); \
 print('kernels + fa2 OK')"
 
+# ── PaliGemma tokenizer for the Pi0 / Pi0.5 frontends. FlashRT would
+#    fetch it on first use, but containers started with --rm would then
+#    re-download it every run. Same source and location as
+#    scripts/download_paligemma_tokenizer.sh. ──
+RUN mkdir -p /root/.cache/flash_rt \
+ && curl -fsSL https://storage.googleapis.com/big_vision/paligemma_tokenizer.model \
+        -o /root/.cache/flash_rt/paligemma_tokenizer.model
+
+# ── lerobot (git submodule, pinned in .gitmodules). Installed editable
+#    at the path the repo is bind-mounted to at runtime (see
+#    scripts/run_rollout_container.sh), so the mounted checkout shadows
+#    this copy and host-side edits take effect without a rebuild; the
+#    copy baked in here is what runs when nothing is mounted.
+#    Extras: pi (PI05 processors + tokenizer), damiao (python-can for the
+#    OpenArm motors), core_scripts (dataset recording, hardware input,
+#    rerun viz). Run `git submodule update --init` before building. ──
+COPY lerobot/ /lerobot-flashrt/lerobot/
+RUN test -f /lerobot-flashrt/lerobot/pyproject.toml \
+     || { echo "lerobot/ is empty: run 'git submodule update --init' before docker build" >&2; exit 1; } \
+ && python3 -m pip install --no-cache-dir -e "/lerobot-flashrt/lerobot[core_scripts,damiao,pi]" \
+ && python3 -c "import lerobot, can, transformers; \
+from lerobot.rollout import build_rollout_context; \
+from lerobot.policies.pi05.modeling_pi05 import PI05Policy; \
+print('lerobot', lerobot.__version__, 'OK')"
+
+# ── torchcodec with NVDEC (GPU) decoding. The PyPI wheel lerobot pulls
+#    in above is CPU-only and built for the latest torch, so it cannot
+#    load against the NGC torch (2.9 / CUDA 13) and lerobot silently
+#    falls back to PyAV. Replace it with the CUDA 13 build of the
+#    torch-2.9 release line, plus the system FFmpeg shared libraries it
+#    links against (Ubuntu's FFmpeg 6.1 ships the cuvid/NVDEC decoders).
+#    Change TORCHCODEC_VERSION / TORCHCODEC_INDEX together with
+#    BASE_IMAGE: torchcodec 0.8 <-> torch 2.9, 0.10 <-> 2.10, 0.11 <-> 2.11.
+#    GPU decoding at runtime also needs the `video` driver capability,
+#    which the NGC base image sets (NVIDIA_DRIVER_CAPABILITIES). ──
+ARG TORCHCODEC_VERSION=0.8.1
+ARG TORCHCODEC_INDEX=https://download.pytorch.org/whl/cu130
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg \
+    && rm -rf /var/lib/apt/lists/* \
+ && python3 -m pip install --no-cache-dir --no-deps --force-reinstall \
+        "torchcodec==${TORCHCODEC_VERSION}" --index-url "${TORCHCODEC_INDEX}" \
+ && python3 -c "import torchcodec; from torchcodec.decoders import VideoDecoder; \
+from lerobot.utils.import_utils import get_safe_default_video_backend as b; \
+assert b() == 'torchcodec', b(); \
+print('torchcodec', torchcodec.__version__, 'OK')"
+
 # Default to a Python REPL with flash_rt pre-imported. Override with
 #   docker run --rm --gpus all -it flashrt:dev <your-command>
 CMD ["python3", "-c", "import flash_rt; print('flash_rt', flash_rt.__version__, '— ready'); import code; code.interact(local={'flash_rt': flash_rt})"]
