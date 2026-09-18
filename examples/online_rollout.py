@@ -466,65 +466,6 @@ def _install_episode_engine_pause() -> None:
     logger.info("Installed episode-end inference pause (EpisodicStrategy)")
 
 
-def _install_record_decimation(ctx, cfg: RolloutConfig) -> None:
-    """Record one dataset frame per camera frame, not per control tick.
-
-    ``--interpolation_multiplier=N`` raises the control loop to ``fps * N``
-    (``ActionInterpolator.get_control_interval`` returns ``1/(fps*N)``) so the
-    arm gets smoothed commands, while the policy is still consumed at ``fps``
-    — the interpolator buffers N blends and only pulls a new action when that
-    buffer empties.  That part is correct.  The recording is not: the strategy
-    writes a dataset frame on *every* control tick, but the dataset is created
-    with ``cfg.dataset.fps`` (``rollout/context.py``), and nothing reconciles
-    the two.
-
-    With ``fps=30, N=3`` against 30 fps cameras that gives a 10 s episode 881
-    frames declared at 30 fps — 29 s of playback, where 2 of every 3 frames are
-    the same camera capture, and the image writer does 3x the work *during* the
-    episode.
-
-    Forwarding only every Nth ``add_frame`` keeps the dataset at the camera
-    rate while control stays at ``fps * N``.  Decimation is uniform rather than
-    aligned to the interpolator's policy-action boundary, because regular
-    spacing is what a fixed ``dataset.fps`` actually claims; each kept frame
-    still pairs the observation of that tick with the action sent on it.
-
-    Set ``FLASHRT_RECORD_DECIMATE=0`` to record every tick.
-    """
-    n = int(getattr(cfg, "interpolation_multiplier", 1) or 1)
-    if n <= 1:
-        return
-    if os.environ.get("FLASHRT_RECORD_DECIMATE", "1") == "0":
-        logger.info("Record decimation disabled via FLASHRT_RECORD_DECIMATE=0")
-        return
-
-    dataset = getattr(getattr(ctx, "data", None), "dataset", None)
-    if dataset is None:
-        return          # strategy records nothing (e.g. base)
-
-    original = dataset.add_frame
-    if getattr(original, "_flashrt_decimated", False):
-        return
-
-    state = {"tick": 0}
-
-    @wraps(original)
-    def decimated_add_frame(*args, **kwargs):
-        tick = state["tick"]
-        state["tick"] = tick + 1
-        if tick % n:
-            return None
-        return original(*args, **kwargs)
-
-    decimated_add_frame._flashrt_decimated = True
-    dataset.add_frame = decimated_add_frame
-    logger.info(
-        "Recording 1 frame per %d control ticks (interpolation_multiplier=%d): "
-        "control %.0f Hz, dataset %.0f Hz",
-        n, n, cfg.fps * n, cfg.fps,
-    )
-
-
 def _configure_torch_threads() -> None:
     """Bound the torch CPU thread pool for the control loop.
 
@@ -1237,10 +1178,6 @@ def rollout(cfg: RolloutConfig):
     # disconnected — even if FlashRT load or strategy creation fails.
     strategy = None
     try:
-        # Keep the dataset at the camera rate when interpolation raises the
-        # control rate. Must happen before the strategy starts recording.
-        _install_record_decimation(ctx, cfg)
-
         # Swap in FlashRT as the policy inference backend.
         # Must happen before strategy.setup() starts the RTC thread.
         _install_flashrt_backend(ctx, cfg)
