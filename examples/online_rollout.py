@@ -32,6 +32,7 @@ import os
 import sys
 import time
 import types
+from contextlib import contextmanager, nullcontext
 from functools import wraps
 
 import numpy as np
@@ -253,6 +254,90 @@ def _install_fast_policy_load() -> None:
     fast_from_pretrained._flashrt_fast_load = True
     PI05Policy.from_pretrained = classmethod(fast_from_pretrained)
     logger.info("Installed fast policy load (no random init, no mmap, assign)")
+
+
+class _FlashRTModelStub(torch.nn.Module):
+    """Parameter-free stand-in for ``PI05Pytorch`` when FlashRT owns the forward.
+
+    Accepts the same constructor arguments so ``PI05Policy.__init__`` runs
+    unchanged, and exposes the attributes the policy touches outside the
+    forward pass (``rtc_processor``, ``gradient_checkpointing_enable``).  Any
+    attempt to actually run the PyTorch model fails loudly instead of silently
+    producing garbage from unloaded weights.
+    """
+
+    def __init__(self, config, rtc_processor=None):
+        super().__init__()
+        self.config = config
+        self.rtc_processor = rtc_processor
+
+    def gradient_checkpointing_enable(self):
+        pass
+
+    def gradient_checkpointing_disable(self):
+        pass
+
+    def _unavailable(self, *args, **kwargs):
+        raise RuntimeError(
+            "The PyTorch PI05 model was not loaded (FlashRT weightless policy load). "
+            "predict_action_chunk must be served by FlashRT; set "
+            "FLASHRT_WEIGHTLESS_POLICY=0 to load the full PyTorch model."
+        )
+
+    forward = sample_actions = denoise_step = embed_prefix = embed_suffix = _unavailable
+
+
+def _install_weightless_policy_load() -> bool:
+    """Build ``PI05Policy`` without the PyTorch model it would never run.
+
+    FlashRT loads its own copy of the weights from the checkpoint and serves
+    ``predict_action_chunk``, so the ~9 GB ``PI05Pytorch`` submodule is dead
+    weight — and with ``--policy.device=cuda`` it lands in GPU memory next to
+    FlashRT's copy.  This swaps it for :class:`_FlashRTModelStub` during
+    construction and skips the state-dict load entirely, so the policy object
+    keeps everything the rollout stack actually uses (config, ``reset()``,
+    RTC wiring, the ``predict_action_chunk`` hook) while the preprocessor,
+    tokenizer outputs, normalizer and postprocessor all run on the GPU.
+
+    Returns True if installed.  Set ``FLASHRT_WEIGHTLESS_POLICY=0`` to load the
+    full PyTorch model instead (falls back to :func:`_install_fast_policy_load`).
+    PEFT checkpoints always take the full load, since the adapter has to wrap
+    real modules.
+    """
+    if os.environ.get("FLASHRT_WEIGHTLESS_POLICY", "1") == "0":
+        logger.info("Weightless policy load disabled via FLASHRT_WEIGHTLESS_POLICY=0")
+        return False
+
+    from lerobot.policies.pi05 import modeling_pi05
+    from lerobot.policies.pi05.modeling_pi05 import PI05Policy
+
+    if getattr(PI05Policy.from_pretrained.__func__, "_flashrt_weightless", False):
+        return True
+
+    original = PI05Policy.from_pretrained.__func__
+
+    @wraps(original)
+    def weightless_from_pretrained(cls, pretrained_name_or_path, *args, config=None, **kwargs):
+        if config is None or getattr(config, "use_peft", False):
+            logger.warning("Weightless policy load needs a non-PEFT config; using the full load")
+            return original(cls, pretrained_name_or_path, *args, config=config, **kwargs)
+
+        stock_model_cls = modeling_pi05.PI05Pytorch
+        modeling_pi05.PI05Pytorch = _FlashRTModelStub
+        try:
+            policy = cls(config)
+        finally:
+            modeling_pi05.PI05Pytorch = stock_model_cls
+        logger.info(
+            "PI05Policy built without PyTorch weights (%d parameters); FlashRT serves inference",
+            sum(p.numel() for p in policy.parameters()),
+        )
+        return policy
+
+    weightless_from_pretrained._flashrt_weightless = True
+    PI05Policy.from_pretrained = classmethod(weightless_from_pretrained)
+    logger.info("Installed weightless policy load (PyTorch PI05 model not materialized)")
+    return True
 
 
 def _is_viz_image(value) -> bool:
@@ -681,6 +766,213 @@ def _warmup_flashrt(model, task: str, imgs: list, state, n_iters: int = 20) -> N
     logger.info("FlashRT warmup complete")
 
 
+# ── Per-chunk latency profiler ────────────────────────────────────────────────
+
+class _LatencyProfiler:
+    """Times each stage of one RTC inference chunk, from observation to actions.
+
+    A chunk record is opened when the RTC thread starts converting an
+    observation (``build_dataset_frame``) and closed when the postprocessor
+    returns, which is the moment the chunk is ready to merge into the queue.
+    Stages:
+
+        obs_wait         robot observation handed to the engine -> picked up
+        build_frame      raw robot dict -> dataset-shaped frame
+        obs_prep         upload + /255 + CHW (GPU)
+        preprocess       normalize, state tokens, tokenizer, device move
+        flashrt_inputs   resize-with-pad + uint8 quantize + GPU->host copy
+        flashrt_predict  FlashRT forward (VLM prefix + action expert)
+        to_device        numpy chunk -> torch on the policy device
+        postprocess      unnormalize (GPU) + move to CPU
+        other            RTC bookkeeping between the stages above
+
+    ``inference`` is the sum of every stage but ``obs_wait`` (the latency
+    RTC's delay estimate sees); ``e2e`` adds ``obs_wait`` on top.
+
+    CUDA work is asynchronous, so each stage boundary synchronizes the device
+    — otherwise GPU time is billed to whichever later stage happens to block.
+    The syncs cost tens of microseconds per stage.
+
+    ``FLASHRT_LATENCY_LOG=0`` disables profiling entirely (no syncs).
+    ``FLASHRT_LATENCY_EVERY=N`` logs every Nth chunk (default 1; 0 = never).
+    ``FLASHRT_LATENCY_SUMMARY=N`` logs mean/p50/p90/max every N chunks
+    (default 100; 0 = never).
+    """
+
+    STAGES = ("obs_wait", "build_frame", "obs_prep", "preprocess", "flashrt_inputs",
+              "flashrt_predict", "to_device", "postprocess", "other")
+
+    def __init__(self, device, every: int, summary_every: int):
+        self._sync = torch.device(device).type == "cuda"
+        self._every = every
+        self._summary_every = summary_every
+        self._rec = None
+        self._owner = None
+        self._t0 = 0.0
+        self._count = 0
+        self._history = {k: [] for k in self.STAGES + ("inference", "e2e")}
+        self._obs_stamp = (None, 0.0)   # (id(obs), perf_counter at hand-off)
+
+    def _now(self) -> float:
+        if self._sync:
+            torch.cuda.synchronize()
+        return time.perf_counter()
+
+    def stamp_observation(self, obs) -> None:
+        self._obs_stamp = (id(obs), time.perf_counter())
+
+    def begin(self, obs) -> None:
+        import threading
+        self._owner = threading.get_ident()
+        self._t0 = self._now()
+        obs_id, t_obs = self._obs_stamp
+        self._rec = {"obs_wait": (self._t0 - t_obs) if obs_id == id(obs) else 0.0}
+
+    @contextmanager
+    def step(self, name: str):
+        import threading
+        if self._rec is None or threading.get_ident() != self._owner:
+            yield
+            return
+        t = self._now()
+        try:
+            yield
+        finally:
+            self._rec[name] = self._rec.get(name, 0.0) + (self._now() - t)
+
+    def end(self) -> None:
+        import threading
+        rec = self._rec
+        if rec is None or threading.get_ident() != self._owner:
+            return
+        self._rec = None
+        total = time.perf_counter() - self._t0
+        rec["other"] = max(0.0, total - sum(v for k, v in rec.items() if k != "obs_wait"))
+        rec["inference"] = total
+        rec["e2e"] = total + rec["obs_wait"]
+        self._count += 1
+        for k, v in rec.items():
+            self._history[k].append(v)
+
+        if self._every and self._count % self._every == 0:
+            parts = [f"{k} {_fmt_ms_hz(rec.get(k, 0.0))}" for k in self.STAGES]
+            logger.info(
+                "[latency] chunk %d | %s || inference %s | e2e %s",
+                self._count, " | ".join(parts),
+                _fmt_ms_hz(rec["inference"]), _fmt_ms_hz(rec["e2e"]),
+            )
+        if self._summary_every and self._count % self._summary_every == 0:
+            self._log_summary()
+
+    def _log_summary(self) -> None:
+        lines = [f"[latency] summary over last {self._summary_every} chunks "
+                 f"({self._count} total)",
+                 f"  {'stage':<16}{'mean ms':>9}{'p50 ms':>9}{'p90 ms':>9}{'max ms':>9}{'mean Hz':>10}"]
+        for k in self.STAGES + ("inference", "e2e"):
+            v = np.asarray(self._history[k][-self._summary_every:]) * 1e3
+            if v.size == 0:
+                continue
+            mean = float(v.mean())
+            hz = f"{1e3 / mean:10.1f}" if mean > 0 else f"{'-':>10}"
+            lines.append(f"  {k:<16}{mean:9.2f}{np.percentile(v, 50):9.2f}"
+                         f"{np.percentile(v, 90):9.2f}{v.max():9.2f}{hz}")
+        logger.info("\n".join(lines))
+        for k in self._history:
+            del self._history[k][:-self._summary_every]
+
+
+def _fmt_ms_hz(seconds: float) -> str:
+    ms = seconds * 1e3
+    return f"{ms:.2f}ms ({1e3 / ms:.0f}Hz)" if ms > 0 else f"{ms:.2f}ms (-)"
+
+
+class _TimedProcessor:
+    """Proxy that times ``__call__`` and forwards everything else (``reset`` …)."""
+
+    def __init__(self, inner, profiler: _LatencyProfiler, name: str, closes_chunk: bool = False):
+        self._inner = inner
+        self._profiler = profiler
+        self._name = name
+        self._closes_chunk = closes_chunk
+
+    def __call__(self, *args, **kwargs):
+        with self._profiler.step(self._name):
+            out = self._inner(*args, **kwargs)
+        if self._closes_chunk:
+            self._profiler.end()
+        return out
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
+_PROFILER: "_LatencyProfiler | None" = None
+
+
+def _prof_step(name: str):
+    """Profiler stage context for code that runs inside a chunk; no-op when off."""
+    return _PROFILER.step(name) if _PROFILER is not None else nullcontext()
+
+
+def _install_latency_profiler(ctx, cfg: RolloutConfig) -> None:
+    """Hook the RTC engine's per-chunk stages into :class:`_LatencyProfiler`.
+
+    Must run after :func:`_install_fast_observation_prep` (it wraps whichever
+    observation prep is live) and before ``strategy.setup()`` starts the RTC
+    thread.  Only the engine's own references are wrapped — calibration and
+    warmup go through ``ctx.policy.preprocessor`` and stay untimed.
+    """
+    global _PROFILER
+    if os.environ.get("FLASHRT_LATENCY_LOG", "1") == "0":
+        logger.info("Latency profiler disabled via FLASHRT_LATENCY_LOG=0")
+        return
+
+    from lerobot.rollout.inference import rtc as _rtc
+
+    engine = ctx.policy.inference
+    if not isinstance(engine, _rtc.RTCInferenceEngine):
+        logger.warning("Latency profiler only supports --inference.type=rtc; skipping")
+        return
+
+    prof = _LatencyProfiler(
+        cfg.device,
+        every=int(os.environ.get("FLASHRT_LATENCY_EVERY", "1")),
+        summary_every=int(os.environ.get("FLASHRT_LATENCY_SUMMARY", "100")),
+    )
+
+    stock_notify = engine.notify_observation
+
+    def notify_observation(obs):
+        prof.stamp_observation(obs)
+        return stock_notify(obs)
+
+    engine.notify_observation = notify_observation
+
+    stock_build = _rtc.build_dataset_frame
+    stock_prep = _rtc.prepare_observation_for_inference
+
+    def timed_build_dataset_frame(features, values, *args, **kwargs):
+        prof.begin(values)
+        with prof.step("build_frame"):
+            return stock_build(features, values, *args, **kwargs)
+
+    def timed_prepare_observation(*args, **kwargs):
+        with prof.step("obs_prep"):
+            return stock_prep(*args, **kwargs)
+
+    _rtc.build_dataset_frame = timed_build_dataset_frame
+    _rtc.prepare_observation_for_inference = timed_prepare_observation
+    engine._preprocessor = _TimedProcessor(engine._preprocessor, prof, "preprocess")
+    engine._postprocessor = _TimedProcessor(
+        engine._postprocessor, prof, "postprocess", closes_chunk=True)
+
+    _PROFILER = prof
+    logger.info(
+        "Installed latency profiler (cuda sync=%s, log every %d chunk(s), summary every %d)",
+        prof._sync, prof._every, prof._summary_every,
+    )
+
+
 # ── Emergency robot disconnect ────────────────────────────────────────────────
 
 def _emergency_disconnect(ctx) -> None:
@@ -856,16 +1148,17 @@ def _install_flashrt_backend(ctx, cfg: RolloutConfig) -> None:
         # prev_chunk_left_over is already in the same normalized space this
         # function returns (it is the `original` tensor from ActionQueue.merge),
         # so it can go straight to FlashRT with no conversion.
-        prev_np = None
-        if _rtc_on:
-            prev = kwargs.get("prev_chunk_left_over")
-            if prev is not None:
-                if prev.dim() == 3:
-                    prev = prev.squeeze(0)
-                prev_np = prev[:, :_act_dim].float().cpu().numpy()
+        with _prof_step("flashrt_inputs"):
+            prev_np = None
+            if _rtc_on:
+                prev = kwargs.get("prev_chunk_left_over")
+                if prev is not None:
+                    if prev.dim() == 3:
+                        prev = prev.squeeze(0)
+                    prev_np = prev[:, :_act_dim].float().cpu().numpy()
 
-        # Resize + uint8 exactly as the warmup/calibration frame was prepared.
-        imgs, state_np = _extract_flashrt_inputs(batch, _views)
+            # Resize + uint8 exactly as the warmup/calibration frame was prepared.
+            imgs, state_np = _extract_flashrt_inputs(batch, _views)
 
         # The full state goes into the prompt — truncating it would produce a
         # token sequence the checkpoint was never trained on.
@@ -878,7 +1171,7 @@ def _install_flashrt_backend(ctx, cfg: RolloutConfig) -> None:
             _state_dim_warned = True
 
         # FlashRT inference — returns (chunk_size, 32) normalized actions
-        with torch.no_grad():
+        with torch.no_grad(), _prof_step("flashrt_predict"):
             chunk_np = _model.predict(
                 images=imgs,
                 prompt=_task,
@@ -888,12 +1181,13 @@ def _install_flashrt_backend(ctx, cfg: RolloutConfig) -> None:
             )
 
         # Slice to action_dim, return (1, T, action_dim) on target device
-        return (
-            torch.from_numpy(chunk_np[:, :_act_dim])
-            .float()
-            .unsqueeze(0)
-            .to(_device)
-        )
+        with _prof_step("to_device"):
+            return (
+                torch.from_numpy(chunk_np[:, :_act_dim])
+                .float()
+                .unsqueeze(0)
+                .to(_device)
+            )
 
     # Bind and install on the policy instance — shadows the class method so
     # both ctx.policy.policy and ctx.policy.inference._policy see the new impl.
@@ -914,7 +1208,8 @@ def rollout(cfg: RolloutConfig):
 
     _configure_torch_threads()
     _install_fast_observation_prep()
-    _install_fast_policy_load()
+    if not _install_weightless_policy_load():
+        _install_fast_policy_load()
     _install_throttled_telemetry()
     _install_episode_engine_pause()
 
@@ -949,6 +1244,10 @@ def rollout(cfg: RolloutConfig):
         # Swap in FlashRT as the policy inference backend.
         # Must happen before strategy.setup() starts the RTC thread.
         _install_flashrt_backend(ctx, cfg)
+
+        # Per-chunk stage timings (ms / Hz) for the RTC inference thread.
+        # Must happen before strategy.setup() starts the RTC thread.
+        _install_latency_profiler(ctx, cfg)
 
         strategy = create_strategy(cfg.strategy)
         logger.info(
