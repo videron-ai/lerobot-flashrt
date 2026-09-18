@@ -1,0 +1,57 @@
+# teleop.yaml
+robot:
+  type: bi_openarm_follower
+  id: my_bimanual_follower
+  cameras:
+    left_wrist:  { type: opencv, index_or_path: "/dev/left_wrist", width: 1280, height: 720, fps: 30,fourcc: 'MJPG' ,backend: "V4L2"}
+    right_wrist: { type: opencv, index_or_path: "/dev/right_wrist", width: 1280, height: 720, fps: 30,fourcc: 'MJPG' , backend: "V4L2"}
+    base:        { type: opencv, index_or_path: "/dev/base", width: 640, height: 480, fps: 30,fourcc: 'MJPG' }
+  left_arm_config:
+    port: left_arm
+    side: null  # null because we're giving custom limits
+    use_can_fd: False
+    max_relative_target:
+      joint_1: 10.0
+      joint_2: 10.0
+      joint_3: 10.0
+      joint_4: 10.0
+      joint_5: 10.0
+      joint_6: 10.0
+      joint_7: 10.0
+      gripper: 100.0
+    #position_kp: [120,120,120,120,15,20,15,15]
+    joint_limits:
+      joint_1: [-200.0, 80.0]  # <- paste LEFT preset values here
+      joint_2: [-190.0, 10.0]
+      joint_3: [-90.0, 90.0]
+      joint_4: [0.0, 140.0]
+      joint_5: [-90.0, 90.0]
+      joint_6: [-45.0, 45.0]
+      joint_7: [-90.0, 90.0]
+      gripper: [-160.0, 0]   # <- the safe range
+    
+  right_arm_config:
+    port: right_arm
+    side: null
+    use_can_fd: False
+    max_relative_target:
+      joint_1: 10.0
+      joint_2: 10.0
+      joint_3: 10.0
+      joint_4: 10.0
+      joint_5: 10.0
+      joint_6: 10.0
+      joint_7: 10.0
+      gripper: 100.0
+    #position_kp: [120,120,120,120,15,20,15,15]
+    joint_limits:
+      joint_1: [-80.0, 200.0]  # <- paste RIGHT preset values here
+      joint_2: [-10.0, 190.0]
+      joint_3: [-90.0, 90.0]
+      joint_4: [0.0, 140.0]
+      joint_5: [-90.0, 90.0]
+      joint_6: [-45.0, 45.0]
+      joint_7: [-90.0, 90.0]
+      gripper: [-160.0, 0]
+      
+display_data: False
