@@ -17,6 +17,9 @@
 #     MODELS_DIR    host checkpoint directory      (default ~/Desktop/Models)
 #     LEFT_WRIST_CAM / RIGHT_WRIST_CAM / BASE_CAM
 #                   /dev/v4l/by-path entries for each camera
+#     FLASHRT_* / FVK_*
+#                   forwarded into the container unchanged, e.g.
+#                   FLASHRT_PRECISION=bf16 bash scripts/run_rollout_container.sh ...
 
 set -euo pipefail
 
@@ -53,7 +56,15 @@ if [[ $# -eq 0 ]]; then
     set -- /bin/bash
 fi
 
+# Forward FlashRT tuning knobs (FLASHRT_PRECISION, FLASHRT_CALIB_*, ...) set on
+# the host; docker run does not inherit the caller's environment.
+env_args=()
+while IFS= read -r name; do
+    env_args+=(-e "$name")
+done < <(compgen -e | grep -E '^(FLASHRT|FVK)_' || true)
+
 exec docker run \
+    "${env_args[@]}" \
     -e DISPLAY="${DISPLAY:-}" \
     -v /tmp/.X11-unix:/tmp/.X11-unix \
     -v "$HOME/.Xauthority:/root/.Xauthority" \

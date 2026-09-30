@@ -107,8 +107,11 @@ def parse_args():
     p.add_argument("--out_dir", default="./rollout_outputs")
     p.add_argument("--no_save", action="store_true")
     p.add_argument("--device", default="cuda")
-    p.add_argument("--precision", default="fp8", choices=["fp8", "fp16"],
-                   help="FlashRT numeric path. 'fp16' is the non-quantized "
+    p.add_argument("--precision", default="fp8", choices=["fp8", "bf16", "fp16"],
+                   help="FlashRT numeric path. 'bf16' is the RTX pipeline "
+                        "with FP8 off: no calibration, 4.8%% lower chunk MAE "
+                        "than fp8 on the training set, ~33 ms slower. "
+                        "'fp16' is the non-quantized "
                         "path: measured 18.7% lower mean per-joint MAE than "
                         "fp8, concentrated in the gripper joints, at the cost "
                         "of exact-length prompt graphs.")
@@ -197,11 +200,14 @@ def load_policy_and_processors(ckpt: Path, action_horizon: int, *,
             "rtc_max_guidance_weight": max_guidance_weight,
         }
 
-    if precision not in ("fp8", "fp16"):
-        raise ValueError(f"precision must be 'fp8' or 'fp16', got {precision!r}")
-    precision_kwargs = (
-        {"use_fp16": True, "use_fp8": False} if precision == "fp16" else {}
-    )
+    if precision not in ("fp8", "bf16", "fp16"):
+        raise ValueError(
+            f"precision must be 'fp8', 'bf16' or 'fp16', got {precision!r}")
+    precision_kwargs = {
+        "fp8": {},
+        "bf16": {"use_fp8": False},        # RTX frontend with FP8 off = BF16
+        "fp16": {"use_fp16": True, "use_fp8": False},
+    }[precision]
 
     model = flash_rt.load_model(
         checkpoint=str(ckpt),

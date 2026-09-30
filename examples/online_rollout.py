@@ -1014,16 +1014,30 @@ def _install_flashrt_backend(ctx, cfg: RolloutConfig) -> None:
     # Costs: no ``state_prompt_mode="fixed"`` support, so the graph tracks the
     # exact prompt length and recaptures when it changes; and arming RTC
     # disables the fused action-update kernel.
+    #
+    # ``FLASHRT_PRECISION=bf16`` runs the same RTX pipeline as fp8 with FP8
+    # switched off (``use_fp8=False``): every GEMM in BF16, the checkpoint's
+    # training dtype.  Measured on 640 held-out training frames
+    # (examples/calib_search/README.md): chunk MAE vs GT 0.942 -> 0.897 (-4.8%),
+    # grippers j7/j15 2.25/2.65 -> 2.17/2.52, within 0.7% of the FP16 path.
+    # Unlike fp16 it keeps the one fixed-shape graph, so no recapture stalls
+    # and no growth per prompt length.  There are no activation scales, so it
+    # needs no calibration frames, and it uses ~3.4 GiB *less* device memory
+    # than fp8 (fp8 keeps the BF16 weights resident beside its FP8 copies).
+    # Costs: ~33 ms more per inference on GB10 (109 vs 76 ms).
     precision = os.environ.get("FLASHRT_PRECISION", "fp8").lower()
-    if precision not in ("fp8", "fp16"):
+    if precision not in ("fp8", "bf16", "fp16"):
         raise ValueError(
-            f"FLASHRT_PRECISION must be 'fp8' or 'fp16', got {precision!r}"
+            f"FLASHRT_PRECISION must be 'fp8', 'bf16' or 'fp16', got {precision!r}"
         )
-    precision_kwargs = (
-        {"use_fp16": True, "use_fp8": False} if precision == "fp16" else {}
-    )
-    # state_prompt_mode is only honoured by the FP8 frontend; load_model drops
-    # it for FP16 rather than erroring, so pass it only where it does something.
+    precision_kwargs = {
+        "fp8": {},
+        "bf16": {"use_fp8": False},
+        "fp16": {"use_fp16": True, "use_fp8": False},
+    }[precision]
+    # state_prompt_mode is only honoured by the RTX (fp8/bf16) frontend;
+    # load_model drops it for FP16 rather than erroring, so pass it only where
+    # it does something.
     mode_kwargs = {} if precision == "fp16" else {"state_prompt_mode": "fixed"}
 
     logger.info(
@@ -1043,13 +1057,32 @@ def _install_flashrt_backend(ctx, cfg: RolloutConfig) -> None:
         **rtc_kwargs,
     )
 
+    if precision == "bf16":
+        # use_fp8=False only means BF16 on the RTX frontend; Thor's Pi0.5
+        # frontend reads the same kwarg as "FP16 kernels". Fail loudly rather
+        # than run a precision nobody asked for.
+        frontend = flash_model._pipe
+        if getattr(frontend, "use_fp8", None) is not False or \
+                not hasattr(frontend, "_pipeline_precision_kwargs"):
+            raise RuntimeError(
+                f"FLASHRT_PRECISION=bf16 needs the Pi0.5 RTX frontend "
+                f"(SM120/SM121/SM89); got {type(frontend).__name__}")
+
     # Calibrate before anything else touches predict(). FlashRT freezes its FP8
     # activation scales on the first inference, so whatever runs first decides
     # them — and one frame of the robot's home pose is a poor choice (see
     # _calibrate_flashrt for the measured cost). Explicit calibration clears
     # the lazy-bootstrap latch, so the warmup below no longer sets the scales.
+    #
+    # BF16 has no activation scales: calibrating it on the old 16-frame cache,
+    # the tuned 32-frame set or a single home-pose frame gave identical actions
+    # (MAE 0.8967 / 0.8969 / 0.8968). Skip it — no calibration dataset or cache
+    # is needed; the warmup's first predict() just captures the graph.
     n_calib = int(os.environ.get("FLASHRT_CALIB_FRAMES", "16"))
-    if n_calib > 1:
+    if precision == "bf16":
+        logger.info("BF16 precision: no FP8 activation scales, skipping "
+                    "calibration (FLASHRT_CALIB_FRAMES ignored)")
+    elif n_calib > 1:
         observations = _load_or_build_calibration(
             cfg, ctx, task, view_keys, n_calib)
         _calibrate_flashrt(flash_model, observations, task)
