@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+# The "lerobot_teleoperator_" prefix is what lets LeRobot auto-discover this plugin.
+name = "lerobot_teleoperator_openarm_ker"
+version = "0.3.0"
+description = "LeRobot teleoperator plugin for the OpenArm KER leader arm"
+requires-python = ">=3.12"
+dependencies = [
+    "lerobot",
+    "openarm_ker>=0.3.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
