@@ -45,3 +45,6 @@ internal-docs/
 notes/
 third_party/cutlass
 rollout_outputs*/
+
+# Local LeRobot recordings (lerobot-record / lerobot-ker-record test runs).
+/datasets/
