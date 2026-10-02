@@ -54,7 +54,7 @@ class OpenArmKERConfig(TeleoperatorConfig):
     # the joints in park_engage_joints (shoulder and elbow by default; the wrist is
     # hard to judge by eye) have been within park_engage_tolerance_deg of the ready
     # pose for park_engage_hold_s, or park_go_delay_s after typing "go". The
-    # followers then close the remaining gap at the park speed. "rest" + ENTER
+    # followers then ease onto the KER pose, peaking at the park speed. "rest" + ENTER
     # plays the path backwards to the rest pose, from the ready pose or from KER
     # control (via the ready pose). Bare ENTER does the usual next move: ready, or
     # rest when already at ready.
@@ -64,6 +64,26 @@ class OpenArmKERConfig(TeleoperatorConfig):
     park_engage_tolerance_deg: float = 20.0
     park_engage_hold_s: float = 0.5
     park_go_delay_s: float = 3.0
+    # With the streaming follower, make LeRobot's loop wait whenever the arms are
+    # parked: the robot's connect() returns only once the KER is in control, and
+    # get_action() blocks during later park moves and takeovers. lerobot-record
+    # then never records them. The stock follower cannot do this.
+    park_hold: bool = True
+    # Read ready / go / rest (+ ENTER) from the terminal. Always off under
+    # lerobot-record, whose own n / r / q keys read the same terminal.
+    park_typed_commands: bool = True
+    # Guided recording, only under the lerobot-ker-record launcher (see README):
+    # seconds before the followers rise to the ready pose by themselves at the start
+    # (negative: wait for a double squeeze instead); how long the KER must be held
+    # still back at the ready pose to end an episode (0: only the timer or a key ends
+    # it); and whether the followers return to the rest pose when the session ends.
+    park_auto_ready_s: float = 3.0
+    park_end_hold_s: float = 1.0
+    # How close to the ready pose (joints in park_engage_joints) the KER must be held
+    # still for the episode to end. Separate from park_engage_tolerance_deg, so the
+    # takeover zone can be widened without making episodes end early.
+    park_end_tolerance_deg: float = 20.0
+    park_rest_on_exit: bool = True
     # Hands-free park toggle: squeeze both gripper triggers together twice within
     # park_gesture_window_s. Same as bare ENTER: rest -> ready, ready -> rest,
     # KER control -> ready. One long squeeze, or a double squeeze of one trigger

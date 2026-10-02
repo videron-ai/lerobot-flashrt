@@ -13,5 +13,9 @@ dependencies = [
     "openarm_ker>=0.3.0",
 ]
 
+[project.scripts]
+# lerobot-record plus the guided park workflow (same flags).
+lerobot-ker-record = "lerobot_teleoperator_openarm_ker.record:main"
+
 [tool.setuptools.packages.find]
 where = ["src"]
