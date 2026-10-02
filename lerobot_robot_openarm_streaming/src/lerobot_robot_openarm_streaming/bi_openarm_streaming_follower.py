@@ -338,6 +338,7 @@ class BiOpenArmStreamingFollower(BiOpenArmFollower):
         super().connect(calibrate)
         try:
             self._start_loops()
+            self._hold_for_teleop()
         except BaseException:
             self._stop_loops()
             super().disconnect()
@@ -363,6 +364,14 @@ class BiOpenArmStreamingFollower(BiOpenArmFollower):
                 return
             time.sleep(0.01)
         raise RuntimeError("Control loops did not start in time")
+
+    def _hold_for_teleop(self) -> None:
+        """Let a streaming teleoperator delay the end of connect() (see TargetSource)."""
+        if self.config.target_source == "commands":
+            return
+        hold = getattr(get_target_source(), "hold_until_ready", None)
+        if hold is not None:
+            hold(self._raise_if_failed)
 
     def _stop_loops(self) -> None:
         for loop in self._loops.values():

@@ -20,6 +20,8 @@ wrist encoder modules without reflashing their IDs).
 import json
 import logging
 import math
+import os
+import select
 import sys
 import threading
 import time
@@ -33,7 +35,9 @@ from lerobot.teleoperators.teleoperator import Teleoperator
 from lerobot.utils.decorators import check_if_already_connected, check_if_not_connected
 from openarm_ker.ker_stream import CMD_STANDBY, CMD_STREAM, KERStream
 
+from . import guide as guide_module
 from .config_openarm_ker import OpenArmKERConfig
+from .guide import GuidedSession
 from .park import DoubleSqueeze, ParkController
 
 logger = logging.getLogger(__name__)
@@ -227,6 +231,7 @@ class OpenArmKER(Teleoperator):
         # Park poses in follower joint space (action keys). Rest is the calibration pose.
         self._park_rest = {k: 0.0 for k in self.action_features}
         self._park_ready_path: list[dict[str, float]] = []
+        self._park_blend = 0.0
         if config.mapping_path is not None:
             self._load_mapping(config.mapping_path)
 
@@ -243,12 +248,17 @@ class OpenArmKER(Teleoperator):
                 config.park_engage_hold_s,
                 config.park_engage_joints,
                 config.park_go_delay_s,
+                self._park_blend,
             )
         self._park_gesture: DoubleSqueeze | None = None
         if config.park_gesture:
             if self._park is None:
                 raise ValueError("park_gesture=true needs park=true")
             self._park_gesture = DoubleSqueeze(config.park_gesture_window_s)
+        # Guided recording (lerobot-ker-record): episode boundaries follow the park state.
+        self.guide: GuidedSession | None = None
+        if self._park is not None and guide_module.launcher_active:
+            self.guide = GuidedSession(self)
 
         if config.filter == "none":
             self._filter: OneEuroFilter | None = None
@@ -313,6 +323,7 @@ class OpenArmKER(Teleoperator):
                 # Joints a waypoint doesn't mention keep their value from the previous one.
                 pose = self._park_pose(waypoint, pose, f"park.ready_path[{i}]")
                 self._park_ready_path.append(pose)
+            self._park_blend = float(park.get("blend", self._park_blend))
 
     @staticmethod
     def _park_pose(values: dict, base: dict[str, float], where: str) -> dict[str, float]:
@@ -397,19 +408,49 @@ class OpenArmKER(Teleoperator):
             raise RuntimeError("Parking is off; start with --teleop.park=true")
         self._park.request(command)
 
+    def _ensure_park_listener(self) -> None:
+        if self._park is not None and self._park_listener is None:
+            self._park_listener = threading.current_thread()  # placeholder if no listener starts
+            self._start_park_listener()
+
     def _start_park_listener(self) -> None:
-        # Started on the first get_action(), after the robot's connect() prompts are done.
+        # Started once the robot's connect() prompts are done: when the streaming
+        # follower holds the start, otherwise on the first get_action().
+        how = "double-squeeze both triggers" if self._park_gesture is not None else "call park_command()"
+        if not self.config.park_typed_commands:
+            logger.info(f"park: holding the rest pose. Typed commands are off; {how}.")
+            return
+        if "lerobot.scripts.lerobot_record" in sys.modules:
+            # lerobot-record reads single keys (n, r, q, arrows) from this terminal, so
+            # typing "rest" would also press r = re-record.
+            logger.warning(f"park: typed commands are off under lerobot-record (it reads the same keys); {how}.")
+            return
         if sys.stdin is None or not sys.stdin.isatty():
-            logger.warning("park: no interactive terminal for typed commands; call park_command() instead")
+            logger.warning(f"park: no interactive terminal for typed commands; {how}.")
             return
 
+        fd = sys.stdin.fileno()
+
         def listen() -> None:
-            for line in sys.stdin:
-                word = line.strip().lower() or "toggle"
-                if word in ("ready", "rest", "go", "toggle"):
-                    self._park.request(word)
-                else:
-                    logger.info(f"park: unknown command '{word}'. Type ready, go or rest, then ENTER.")
+            # Read the terminal with select + os.read instead of sys.stdin: a thread
+            # blocked inside sys.stdin holds its lock, and any process forked meanwhile
+            # (LeRobot's video encoders) then hangs forever when it closes its stdin.
+            pending = b""
+            while self._stream is not None:
+                ready, _, _ = select.select([fd], [], [], 0.2)
+                if not ready:
+                    continue
+                data = os.read(fd, 1024)
+                if not data:
+                    return
+                pending += data
+                while b"\n" in pending:
+                    line, pending = pending.split(b"\n", 1)
+                    word = line.decode(errors="ignore").strip().lower() or "toggle"
+                    if word in ("ready", "rest", "go", "toggle"):
+                        self._park.request(word)
+                    else:
+                        logger.info(f"park: unknown command '{word}'. Type ready, go or rest, then ENTER.")
 
         self._park_listener = threading.Thread(target=listen, name="ker-park-commands", daemon=True)
         self._park_listener.start()
@@ -428,8 +469,11 @@ class OpenArmKER(Teleoperator):
             span = c.gripper_closed_deg - c.gripper_open_deg
             squeeze = {s: (action[f"{s}_gripper.pos"] - c.gripper_open_deg) / span for s in SIDES}
             if self._park_gesture.update(squeeze["left"], squeeze["right"], now):
-                logger.info("park: double squeeze")
-                self._park.request("toggle")
+                if self.guide is None or not self.guide.on_gesture():
+                    logger.info("park: double squeeze")
+                    self._park.request("toggle")
+        if self.guide is not None:
+            self.guide.on_sample(action, now)
         return self._park.step(action, now)
 
     # ------------------------------------------------------------------- action
@@ -493,14 +537,30 @@ class OpenArmKER(Teleoperator):
     @check_if_not_connected
     def get_action(self) -> dict[str, float]:
         now = time.monotonic()
-        if self._park is not None and self._park_listener is None:
-            self._park_listener = threading.current_thread()  # placeholder if no listener starts
-            self._start_park_listener()
+        self._ensure_park_listener()
         if self._source is not None:
             # Streaming: the follower's control loop samples the same source at its
             # own rate; this returns (and records) the same target it is tracking.
             self._source.note_poll(now)
             sample = self._source.sample(now)
+            if (
+                self._park is not None
+                and self._park.state != "teleop"
+                and self.config.park_hold
+                and self.guide is None  # guided recording does its waiting between LeRobot's loops
+            ):
+                # Parked mid-session: keep LeRobot's loop (and so the recording) waiting
+                # here until the KER is back in control. The follower's own loops keep
+                # running the park moves. Then hand back the last action from before the
+                # park, which matches the observation LeRobot read just before this call.
+                before = self._last_action
+                self._source.hold_until_ready(lambda: None)
+                now = time.monotonic()
+                self._source.note_poll(now)
+                sample = self._source.sample(now)
+                self._last_advance_t = self._source.last_advance_t
+                if before is not None:
+                    return dict(before)
             self._last_advance_t = self._source.last_advance_t
             if sample is not None and (now - self._last_advance_t) <= self.config.stale_timeout_s:
                 self._last_action = dict(sample.positions)
@@ -585,6 +645,27 @@ class _KERTargetSource:
     def note_poll(self, now: float) -> None:
         with self._lock:
             self._polls.append(now)
+
+    def hold_until_ready(self, check) -> None:
+        """Called by the streaming follower at the end of connect(), with its loops running.
+
+        With park on, blocks until the KER is in control, so LeRobot only starts its
+        loop (and lerobot-record its first episode) after the park move and the
+        takeover. get_action() uses it the same way when parked mid-session. `check`
+        raises if a control loop has failed.
+        """
+        t = self._t
+        if t._park is None or not t.config.park_hold or t.guide is not None:
+            return
+        t._ensure_park_listener()
+        if t._park.state != "teleop":
+            logger.info("park: LeRobot's loop (and any recording) waits until the KER is in control")
+        while t._park.state != "teleop":
+            now = time.monotonic()
+            self.note_poll(now)  # keeps the stream active so the follower tracks the park moves
+            self.sample(now)
+            check()
+            time.sleep(1 / 60)
 
     def _polled(self, now: float) -> bool:
         p = self._polls

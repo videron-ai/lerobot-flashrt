@@ -2,6 +2,9 @@
 robot:
   type: bi_openarm_follower
   id: my_bimanual_follower
+  # Kept in the repo so it survives new containers (run from the repo root). Without a
+  # file here LeRobot re-zeroes the arms at every start.
+  calibration_dir: calibration/openarm_follower
   cameras:
     left_wrist:  { type: opencv, index_or_path: "/dev/left_wrist", width: 1280, height: 720, fps: 30,fourcc: 'MJPG' ,backend: "V4L2"}
     right_wrist: { type: opencv, index_or_path: "/dev/right_wrist", width: 1280, height: 720, fps: 30,fourcc: 'MJPG' , backend: "V4L2"}

@@ -19,12 +19,23 @@ Checked against LeRobot 0.6.2 and openarm_ker 0.3.0.
 - the rig mapping in `ker_mapping.json`: software wrist remap, joint 7 inverted
   on both sides, gripper range 0 to -160 deg;
 - `--teleop.filter=one_euro` with `--teleop.stream_to_follower=true`;
-- park: the rest and ready poses, the `ready_path` in `ker_mapping.json`, and
-  the return to rest;
+- park: the rest and ready poses, the takeover and the return to rest, with the
+  earlier path copied from the rollouts. The current higher path and its corner
+  blending have only run in simulation;
 - the double-squeeze park gesture.
 
+**Recording on the rig** (2026-10-02, streaming encoding, one encoder thread):
+- `lerobot-ker-record`, one three-episode session: the followers rose to ready
+  unprompted, each episode started at the takeover and ended when the KER was
+  held still back at ready, and the followers returned to rest at the end. In
+  the dataset every episode starts with the follower within 3 deg of the KER,
+  no frame-to-frame jump exceeds 6 deg, and each video has exactly one frame
+  per row. The discard gesture, the `q` key and Ctrl-C were not exercised.
+- plain `lerobot-record` with park, one three-episode session: saves and exits
+  cleanly. Parking in the middle of an episode left jumps of up to 42 deg in
+  the data, which is why guided recording parks only between episodes.
+
 **Only tested against a simulated KER stream and simulated motors:**
-- `lerobot-record`;
 - the filter without streaming, and anything with the stock `bi_openarm_follower`
   since the filter, taper and park were added.
 
@@ -66,9 +77,16 @@ LeRobot auto-imports any installed package whose name starts with
 
   ```bash
   lerobot-calibrate --robot.type=bi_openarm_follower --robot.id=my_bimanual_follower \
+    --robot.calibration_dir=$FLASHRT/calibration/openarm_follower \
     --robot.left_arm_config.port=left_arm --robot.left_arm_config.use_can_fd=false \
     --robot.right_arm_config.port=right_arm --robot.right_arm_config.use_can_fd=false
   ```
+
+  `rollout.yaml` sets the same `calibration_dir` (relative to the repo root, where
+  the commands below are run from), so the calibration files live in the repo and
+  survive new containers. Without a file there LeRobot prompts at every start and
+  re-zeroes the arms wherever they are, which shifts every joint angle from one
+  session to the next.
 
   The flags are spelled out here because `lerobot-calibrate` rejects
   `rollout.yaml` (it has no `display_data` field). If a calibration file already
@@ -305,24 +323,40 @@ elbow to gripper; they are not measured.
 ### The path
 
 `ready_path` in the `park` block of `ker_mapping.json`, in follower joint space.
-The first three waypoints are the opening move of the rollouts (medians of 10
-episodes); the fourth is the ready pose.
+Only joints 1 and 4 move; the wrists, joints 2 and 3 and the grippers stay put.
 
-1. **Lift:** joints 1 and 4 together on a straight line in joint space. The
-   upper arms go back about 70 deg while the elbows fold to about 120 deg, so
-   the grippers rise close to the body.
-2. **Turn the wrists** (joint 7).
-3. **Swing forward** with the elbows still folded, to where the rollouts' arms
-   are just before their first grasp.
-4. **Open the elbows to 90 deg** while the upper arms continue forward. In the
-   rough side view the grippers only rise during this segment.
+1. **Tuck:** the upper arms go back 75 deg while the elbows fold to 135 deg.
+   The two move in proportion, so the grippers rise almost straight up beside
+   the body.
+2. **Swing:** the upper arms come forward to 25 deg with the elbows still
+   folded, carrying the grippers over the table edge high.
+3. **Open the elbows to 90 deg:** the ready pose.
 
-Each waypoint lists only the joints it changes. All joints of a segment start
-and stop together, eased in and out, with the fastest joint peaking at
-`park_speed_deg_s` (40). The whole path then takes about 10 s; the policy did
-the lift alone in about 1.2 s. `rest` plays the same waypoints in reverse.
-`rest` defaults to all zeros and can be overridden with
-`"park": {"rest": {...}}`.
+`"blend": 0.25` rounds the two corners, so the move is one continuous motion
+eased in and out once instead of stopping at each waypoint. Each corner is cut
+starting a quarter of the shorter neighbouring segment before the waypoint.
+Joint speeds stay continuous and never exceed `park_speed_deg_s` (40). The move
+takes about 11 s. `rest` plays the same path in reverse. With `blend` left out
+or 0, each segment is eased and stops on its own.
+
+Each waypoint lists only the joints it changes. `rest` defaults to all zeros
+and can be overridden with `"park": {"rest": {...}}`.
+
+Estimated gripper height above the table surface while travelling forward, from
+the same rough side view as above (35 cm upper arm, 36 cm elbow to gripper,
+table at the height of a level forearm; not measured):
+
+| Distance in front of the shoulders | This path | Previous path (copied from the rollouts) |
+|---|---|---|
+| 0-10 cm | 4 cm | about 0 |
+| 10-20 cm | 10 cm | about 0 |
+| 20-30 cm | 17 cm | 0-5 cm |
+| 30-50 cm | 18 cm | 5-8 cm |
+
+The grippers pass table height just behind the shoulder line and peak about
+35 cm above the table, near the shoulders, before coming down to the ready
+pose. To gain more height close to the body, lower `blend` (the tuck corner is
+cut less) or fold the elbows further, up to the 140 deg limit.
 
 ### Taking over
 
@@ -332,13 +366,57 @@ At the ready pose the followers wait. Either:
   at 90 deg and forearms straight ahead. Once joints 1-4 of both arms have been
   within `park_engage_tolerance_deg` (20) of the ready pose for
   `park_engage_hold_s` (0.5 s), the KER takes over. The wrists and the gripper
-  triggers are not part of the match. While waiting, the log shows the three
-  joints furthest off every 2 s.
+  triggers are not part of the match. While waiting, the terminal shows one
+  line, redrawn five times a second, saying how to move the KER, for example
+  `L: upper arm forward 35, bend elbow 37 | R: ok` (degrees still to go; joints
+  already in the zone are left out).
 - **Type `go`.** After `park_go_delay_s` (3 s) the KER takes over wherever it
   is. Use the countdown to get both hands on the KER and hold it over the table.
 
-Either way the followers close the remaining gap at the park speed, then track
-the KER.
+**If matching is hard,** widen the zone and match fewer joints, for example
+`--teleop.park_engage_tolerance_deg=35 --teleop.park_engage_joints=[1,4]`
+(shoulder pitch and elbow only). The followers then travel further in the
+unrecorded takeover blend, and episodes start up to that many degrees from the
+ready pose instead of 20. The zone for ending an episode is set separately by
+`park_end_tolerance_deg`, so it stays at 20.
+
+Either way the followers ease from the ready pose onto the KER pose: every joint
+starts and finishes together, over at least 1 s, with the joint that has the
+furthest to go peaking at the park speed. Then they track the KER.
+
+### Keeping park out of recordings
+
+`lerobot-ker-record` (see Guided recording) is the way to record with park: it
+starts each episode at the takeover and parks only between episodes. The rest of
+this section is what happens under plain `lerobot-record`.
+
+With `bi_openarm_streaming_follower`, park makes LeRobot's loop wait whenever
+the arms are parked (`park_hold`, on by default). The follower's own 250 Hz
+loops keep running the park moves meanwhile.
+- **At the start:** the robot's `connect()` does not return until the KER is in
+  control, so `lerobot-record` starts episode 0 with the followers already
+  tracking the KER.
+- **Later parks:** `get_action()` blocks from the moment a park move starts until
+  the KER is back in control, then returns the last action from before the park.
+  No park move, wait or takeover is recorded.
+
+Park between episodes, in the reset phase. The reset then simply lasts until you
+have taken over again, however short `--dataset.reset_time_s` is, and the next
+episode starts with the KER in control. Parking in the middle of an episode
+also records nothing, but the episode's clock keeps running, so that episode
+ends up shorter, and the two trigger squeezes are in it.
+
+**Under `lerobot-record`, use the gesture.** Typed commands are switched off
+there: `lerobot-record` reads single keys from the same terminal (n = next,
+r = re-record, q = quit), so typing `rest` would also re-record the episode.
+Start it with `--teleop.park_gesture=true`, or nothing can trigger `ready`.
+
+A double squeeze while LeRobot is busy saving an episode is acted on when the
+save finishes. With `--dataset.streaming_encoding=true` saves take well under a
+second.
+
+The stock follower cannot hold LeRobot's loop, so with it episode 0 begins with
+the park move. Re-record that episode once the KER is in control.
 
 ### Things to know
 
@@ -347,21 +425,95 @@ the KER.
   `bi_openarm_streaming_follower` approaches it slowly; the stock follower
   moves there at `max_relative_target` per step. If LeRobot asks to calibrate at
   startup, the pose the arms are in when you press ENTER becomes the rest pose.
-- **After changing the path or the rig.** The `ready_path` in `ker_mapping.json`
-  has run on this rig with this table. The clearance figures above are still
-  estimates, not measurements. After editing a waypoint, moving the table or
-  changing the arms, run it once with `--teleop.park_speed_deg_s=15` and watch
-  the table edge and the wrist cameras.
+- **After changing the path or the rig.** The current `ready_path` has not run
+  on the rig yet, and the clearance figures above are estimates, not
+  measurements. Run it once with `--teleop.park_speed_deg_s=15` and watch the
+  table edge, the wrist cameras, the space behind the elbows and anything above
+  the table near the shoulders. Do the same after editing a waypoint, moving the
+  table or changing the arms.
 - **`go` with the KER far from the ready pose** moves each joint straight to the
-  KER's angle at the park speed. Nothing checks that path against the table.
+  KER's angle, eased, peaking at the park speed. Nothing checks that path
+  against the table.
 - **`ready` from KER control** moves in a straight joint-space line from
   wherever the arms are to the ready pose.
 - **Shutting down.** Type `rest` and wait for `at the rest pose` before Ctrl-C.
   The arms are then already dangling when LeRobot cuts torque.
-- **Needs a live KER stream and an interactive terminal** (`docker run -it`).
-  Without a terminal, call `teleop.park_command("ready")` from your own script.
-- **Recording.** Park moves are returned by `get_action()`, so `lerobot-record`
-  stores them as actions like any other.
+- **Needs a live KER stream.** Typed commands also need an interactive terminal
+  (`docker run -it`); without one, use the gesture or call
+  `teleop.park_command("ready")` from your own script.
+- **Recording.** See Keeping park out of recordings above.
+
+## Guided recording (`lerobot-ker-record`)
+
+`lerobot-ker-record` is `lerobot-record` with the same flags, plus a session
+that runs from the KER. Nothing scripted and no hand-over is recorded.
+
+1. **Start.** After `park_auto_ready_s` (3 s) the followers rise to the ready
+   pose by themselves.
+2. **Take over.** Bring the KER near the ready pose. The terminal bell rings and
+   `park: RECORDING` is logged the moment the takeover completes; that is frame 0
+   of the episode.
+3. **Do the task.**
+4. **End the episode** by bringing the KER back near the ready pose and holding
+   it still for `park_end_hold_s` (1 s). The episode ends there, so every episode
+   starts and ends at about the same pose.
+5. **Reset.** The followers return to the ready pose and hold. Let go, reset the
+   scene; the episode is saved meanwhile.
+6. **Take over again** to start the next episode. There is no clock on this step.
+7. **Session end.** After the last episode, and on `q` or Ctrl-C, the followers
+   return to the rest pose before torque is cut. A second Ctrl-C skips that.
+
+Other controls:
+- **Bad take:** double squeeze during an episode. The take is discarded, the
+  followers return to ready, and the same episode is recorded again after the
+  next takeover. Needs `--teleop.park_gesture=true`.
+- **Lower the arms between episodes:** double squeeze while they hold at ready
+  toggles ready and rest.
+- **Stop early:** `q` in the terminal. Your hands are free whenever the arms are
+  parked.
+- **Episode time:** `--dataset.episode_time_s` is now only an upper limit; an
+  episode that reaches it ends there. The takeover wait does not count.
+
+```bash
+lerobot-ker-record \
+  --config_path=$FLASHRT/helpers/rollout.yaml \
+  --robot.type=bi_openarm_streaming_follower \
+  --teleop.type=openarm_ker --teleop.id=ker \
+  --teleop.mapping_path=ker_mapping.json \
+  --teleop.filter=one_euro \
+  --teleop.stream_to_follower=true \
+  --teleop.park=true \
+  --teleop.park_gesture=true \
+  --dataset.repo_id=${HF_USER}/openarm_ker_demo \
+  --dataset.single_task="Fold the T-shirt properly" \
+  --dataset.num_episodes=20 \
+  --dataset.episode_time_s=120 \
+  --dataset.reset_time_s=2 \
+  --dataset.fps=30 \
+  --dataset.streaming_encoding=true \
+  --dataset.encoder_threads=1
+```
+
+The command is installed with the plugin (`pip install -e` it again after
+pulling this change); `python -m lerobot_teleoperator_openarm_ker.record` is the
+same thing. Keep `reset_time_s` short: it is only the time LeRobot spends before
+saving, and the wait for the takeover comes after it.
+
+Things to know:
+- **Episodes start at the ready pose.** The lift from the calibration pose is
+  scripted and never recorded. A policy trained on this data has to be started
+  from the ready pose too, and data recorded this way differs from older
+  episodes that begin with the lift.
+- **Ending needs a real return.** The episode can only end after the KER has
+  left the ready zone, and then come back within `park_end_tolerance_deg` on
+  the matched joints and stayed within 3 deg for the hold time. A long pause near the
+  ready pose in the middle of a task ends the episode early; raise
+  `park_end_hold_s` if that happens, or set it to 0 to end only by timer or key.
+- **The last second of each episode** is the KER held still at ready.
+- **Works with the stock follower too**, since the launcher does the waiting
+  between LeRobot's loops. That combination has not been tested.
+- **How it works:** the launcher wraps LeRobot's `record_loop`, so it depends on
+  that function keeping its current arguments (checked against LeRobot 0.6.2).
 
 ## 4. Record
 
@@ -380,7 +532,8 @@ lerobot-teleoperate \
   --teleop.filter=one_euro
 ```
 
-Then record:
+Then record. For policy data use `lerobot-ker-record` (see Guided recording
+above); plain `lerobot-record` without park looks like this:
 
 ```bash
 lerobot-record \
@@ -392,8 +545,17 @@ lerobot-record \
   --dataset.repo_id=${HF_USER}/openarm_ker_demo \
   --dataset.single_task="Put the cup on the plate" \
   --dataset.num_episodes=20 \
-  --dataset.fps=30
+  --dataset.fps=30 \
+  --dataset.streaming_encoding=true \
+  --dataset.encoder_threads=1
 ```
+
+`streaming_encoding` encodes the videos while recording, so saving an episode
+takes well under a second instead of blocking the session. Keep
+`encoder_threads=1` with the streaming follower: in simulation the default made
+7% of its 250 Hz ticks overrun, one thread about 1.4% (see that plugin's
+README). Leave `rgb_encoder.vcodec` at its default; `auto` picks `h264_nvenc`,
+which fails to open with LeRobot's default GOP.
 
 `rollout.yaml` sets `display_data: False`; add `--display_data=true` to override it.
 The three cameras are declared at the top level of the robot config, so their
@@ -430,6 +592,12 @@ warning; the speed caps and slow approach replace it.
 | `park_engage_joints` | `[1, 2, 3, 4]` | joints of each arm the KER must match at the ready pose to take over |
 | `park_engage_tolerance_deg` / `park_engage_hold_s` | `20` / `0.5` | how closely and how long those joints must match |
 | `park_go_delay_s` | `3` | countdown after typing `go` before the KER takes over without a match |
+| `park_hold` | `true` | with the streaming follower, make LeRobot's loop (and recording) wait while the arms are parked or being taken over |
+| `park_typed_commands` | `true` | read `ready` / `go` / `rest` from the terminal; always off under `lerobot-record` |
+| `park_auto_ready_s` | `3` | guided recording: delay before the followers rise to ready at the start (negative: wait for a double squeeze) |
+| `park_end_tolerance_deg` | `20` | guided recording: how close to ready (joints in `park_engage_joints`) the KER must be held to end the episode |
+| `park_end_hold_s` | `1` | guided recording: how long the KER must be held still back at ready to end the episode (0: timer or key only) |
+| `park_rest_on_exit` | `true` | guided recording: return to the rest pose when the session ends |
 | `park_gesture` | `false` | double squeeze of both triggers toggles park, like bare ENTER (needs `park=true`) |
 | `park_gesture_window_s` | `1.2` | longest time between the two squeezes |
 | `stale_timeout_s` | `0.25` | no new KER frame for this long = stalled |
@@ -447,7 +615,7 @@ warning; the speed caps and slow approach replace it.
   poses: it approaches the KER pose at 20 deg/s, then ramps to full speed.
   `--teleop.park=true` avoids the snap with either follower: the arms stay
   parked until the KER is near the ready pose or you type `go`, and then
-  close the gap at the park speed.
+  ease onto the KER pose.
 - **Stalls.** If the M5 stops streaming (its jump detection trips, someone taps
   STOP, the USB link drops), `hold` freezes the followers in place. Fix the cause,
   press START on the M5, and re-record the episode (left arrow key).

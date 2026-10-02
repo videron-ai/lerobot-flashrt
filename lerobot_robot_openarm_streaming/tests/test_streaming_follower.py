@@ -481,7 +481,8 @@ def test_park_ready_takeover_and_rest():
         json.dump(mapping, f)
     pose = {"a": [0.0] * 16}
     pose["a"][3] = 40.0  # KER starts with right J4 at 40, nowhere near rest or ready
-    ker, _ = make_ker(lambda t: list(pose["a"]), park=True, park_gesture=True, mapping_path=f.name)
+    ker, _ = make_ker(lambda t: list(pose["a"]), park=True, park_gesture=True, park_hold=False,
+                      mapping_path=f.name)
     robot = sims = None
 
     def run(seconds=None, until=None, timeout=20.0):
@@ -569,6 +570,184 @@ def test_park_ready_takeover_and_rest():
             ker.disconnect()
 
 
+def test_park_holds_connect_until_ker_in_control():
+    """With park on, connect() returns only after the park move and takeover: nothing of it gets recorded."""
+    import json
+    import tempfile
+
+    lift = {f"{s}_joint_{i + 1}": v for s, q in PARK_READY.items() for i, v in enumerate(q[:6])}
+    mapping = {"wrist_remap": {"mode": "none"}, "park": {"ready_path": [lift]}}
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+        json.dump(mapping, f)
+    angles = [0.0] * 16  # KER held 12 deg off the ready pose on the elbows
+    for side, base in (("right", 0), ("left", 8)):
+        angles[base:base + 6] = PARK_READY[side][:6]
+        angles[base + 3] -= 12.0
+    ker, _ = make_ker(lambda t: list(angles), park=True, mapping_path=f.name)
+    robot = sims = None
+    try:
+        threading.Timer(0.7, lambda: ker.park_command("ready")).start()
+        t0 = time.monotonic()
+        robot, sims = make_robot()  # blocks in connect()
+        held = time.monotonic() - t0
+        assert ker.park_state == "teleop" and held > 4.0, (ker.park_state, held)
+        first = ker.get_action()
+        obs = robot.get_observation()
+        gap = max(abs(first[k] - obs[k]) for k in first if "gripper" not in k)
+        assert abs(first["right_joint_4.pos"] - 102.0) < 0.5 and gap < 3.0, (first["right_joint_4.pos"], gap)
+
+        # parking again mid-session: get_action() waits out the park move and the takeover,
+        # then returns the action from before the park
+        for _ in range(10):
+            before = ker.get_action()
+            time.sleep(1 / 30)
+        threading.Timer(0.3, lambda: ker.park_command("ready")).start()
+        t1 = time.monotonic()
+        seen = []
+        while time.monotonic() - t1 < 6.0:
+            t_call = time.monotonic()
+            a = ker.get_action()
+            seen.append((time.monotonic() - t_call, ker.park_state, a))
+            time.sleep(1 / 30)
+        longest, state, returned = max(seen, key=lambda e: e[0])
+        assert longest > 1.0 and state == "teleop" and returned == before, (longest, state)
+        assert all(st == "teleop" for _, st, _ in seen), {st for _, st, _ in seen}
+        return (f"connect() held {held:.1f} s for the park move and takeover; the first action LeRobot sees is the "
+                f"KER pose, with the followers {gap:.1f} deg from it; a later park held get_action() for {longest:.1f} s")
+    finally:
+        try:
+            if robot is not None:
+                teardown(robot, sims)
+        finally:
+            ker.disconnect()
+
+
+def test_guided_recording_session():
+    """lerobot-ker-record end to end: auto ready, takeover, hands-free episode end, discard, auto rest."""
+    import glob
+    import json
+    import tempfile
+
+    import pandas as pd
+
+    import lerobot.scripts.lerobot_record as rec
+    import lerobot_teleoperator_openarm_ker.guide as guide_module
+    import lerobot_teleoperator_openarm_ker.openarm_ker as km
+    from lerobot_teleoperator_openarm_ker import record as launcher
+
+    tmp = Path(tempfile.mkdtemp())
+    motors = [f"joint_{i}" for i in range(1, 8)] + ["gripper"]
+    for side in ("left", "right"):  # calibration files, so connect() does not prompt
+        cal = {m: MotorCalibration(id=i, drive_mode=0, homing_offset=0, range_min=-90, range_max=90)
+               for i, m in enumerate(motors)}
+        with open(tmp / f"guided_{side}.json", "w") as f, draccus.config_type("json"):
+            draccus.dump(cal, f, indent=4)
+    ready = {"left_joint_1": -25, "left_joint_4": 90, "right_joint_1": 25, "right_joint_4": 90}
+    (tmp / "map.json").write_text(json.dumps({"wrist_remap": {"mode": "none"}, "park": {"ready_path": [ready]}}))
+
+    _counter[0] += 1
+    channels = {"left": f"sim_left_{_counter[0]}", "right": f"sim_right_{_counter[0]}"}
+    sims = {side: SimArm(ch) for side, ch in channels.items()}
+    for sim in sims.values():
+        sim.start()
+    pose = [0.0] * 16  # the simulated KER; index 3 = right J4, 0 = right J1, 11 = left J4, 8 = left J1
+    km.KERStream = lambda **kw: FakeKERStream(lambda t: list(pose))
+    holder, failures = {}, []
+    make_teleop = rec.make_teleoperator_from_config
+    rec.make_teleoperator_from_config = lambda c: holder.setdefault("ker", make_teleop(c))
+
+    def wait(cond, what, timeout=40.0):
+        t0 = time.monotonic()
+        while not cond():
+            if time.monotonic() - t0 > timeout:
+                raise AssertionError(f"operator script timed out waiting for {what}")
+            time.sleep(0.01)
+
+    def glide(index, target, seconds=1.0):
+        start = pose[index]
+        for i in range(1, 51):
+            pose[index] = start + (target - start) * i / 50
+            time.sleep(seconds / 50)
+
+    def operator():
+        try:
+            wait(lambda: "ker" in holder, "the teleoperator")
+            ker = holder["ker"]
+            for take in ("discarded", "episode 0", "episode 1"):
+                wait(lambda: ker.park_state == "ready", f"the ready pose before {take}")
+                pose[0], pose[3], pose[8], pose[11] = 25.0, 90.0, -25.0, 90.0  # align the KER
+                wait(lambda: ker.guide.phase == "record", f"recording of {take}")
+                time.sleep(0.5)
+                glide(3, 40.0)  # the task: right elbow down and back
+                time.sleep(0.3)
+                if take == "discarded":
+                    for _ in range(2):  # double squeeze = bad take
+                        pose[7], pose[15] = -60.0, 60.0
+                        time.sleep(0.15)
+                        pose[7], pose[15] = 0.0, 0.0
+                        time.sleep(0.15)
+                else:
+                    glide(3, 90.0)  # back to ready, then hold still: the episode ends by itself
+                wait(lambda: ker.guide.phase != "record", f"the end of {take}")
+        except BaseException as e:  # reported by the main thread
+            failures.append(e)
+
+    cfg = draccus.parse(rec.RecordConfig, args=[
+        "--robot.type=bi_openarm_streaming_follower", "--robot.id=guided", f"--robot.calibration_dir={tmp}",
+        f"--robot.left_arm_config.port={channels['left']}", "--robot.left_arm_config.side=left",
+        "--robot.left_arm_config.can_interface=virtual",
+        f"--robot.right_arm_config.port={channels['right']}", "--robot.right_arm_config.side=right",
+        "--robot.right_arm_config.can_interface=virtual",
+        "--teleop.type=openarm_ker", "--teleop.stream_to_follower=true", f"--teleop.mapping_path={tmp / 'map.json'}",
+        "--teleop.park=true", "--teleop.park_gesture=true", "--teleop.park_auto_ready_s=0.3",
+        "--teleop.park_speed_deg_s=90", "--teleop.park_end_hold_s=0.7",
+        "--dataset.repo_id=local/guided", f"--dataset.root={tmp / 'ds'}", "--dataset.single_task=test",
+        "--dataset.num_episodes=2", "--dataset.episode_time_s=30", "--dataset.reset_time_s=1", "--dataset.fps=30",
+        "--dataset.video=false", "--dataset.push_to_hub=false", "--play_sounds=false",
+    ])
+    thread = threading.Thread(target=operator, daemon=True)
+    try:
+        launcher.install()
+        thread.start()
+        with contextlib.redirect_stdout(io.StringIO()):
+            rec.record(cfg)
+        thread.join(timeout=5)
+        assert not failures, failures[0]
+        ker = holder["ker"]
+        assert ker.park_state == "rest", ker.park_state
+        rest = max(abs(q) for sim in sims.values() for name, q in sim.positions_deg().items() if name != "gripper")
+        assert rest < 2.0, f"followers ended {rest:.1f} deg from the rest pose"
+
+        info = json.loads((tmp / "ds" / "meta" / "info.json").read_text())
+        df = pd.concat(pd.read_parquet(f) for f in sorted(glob.glob(str(tmp / "ds" / "data" / "*" / "*.parquet"))))
+        names = info["features"]["action"]["names"]
+        arm = [i for i, n in enumerate(names) if "gripper" not in n]
+        j4 = names.index("right_joint_4.pos")
+        assert info["total_episodes"] == 2, info["total_episodes"]
+        notes = []
+        for ep in (0, 1):
+            rows = df[df["episode_index"] == ep]
+            a, o = np.stack(rows["action"].to_numpy()), np.stack(rows["observation.state"].to_numpy())
+            seconds = len(a) / 30
+            jump = np.abs(np.diff(a[:, arm], axis=0)).max()
+            start_gap = np.abs(a[0, arm] - o[0, arm]).max()
+            grippers_flick = np.abs(np.diff(a[:, [names.index("left_gripper.pos")]], axis=0)).max()
+            assert 2.0 < seconds < 12.0, f"episode {ep} lasted {seconds:.1f} s (timer is 30 s)"
+            assert abs(a[0, j4] - 90.0) < 2.0 and abs(o[0, j4] - 90.0) < 4.0, (a[0, j4], o[0, j4])  # starts at ready
+            assert a[:, j4].min() < 45.0 and abs(a[-1, j4] - 90.0) < 2.0, (a[:, j4].min(), a[-1, j4])  # task, then ready
+            assert jump < 8.0 and start_gap < 4.0 and grippers_flick < 1.0, (jump, start_gap, grippers_flick)
+            notes.append(f"{seconds:.1f} s")
+        return (f"followers rose to ready unprompted; a double-squeezed take was discarded; 2 episodes recorded "
+                f"({', '.join(notes)}, each from takeover to the KER held still at ready, no park move or jump in "
+                f"the data); followers returned to rest ({rest:.1f} deg) before disconnect")
+    finally:
+        rec.make_teleoperator_from_config = make_teleop
+        guide_module.launcher_active = False
+        for sim in sims.values():
+            with contextlib.suppress(Exception):
+                sim.stop()
+
+
 @dataclass
 class _CliBoth:
     robot: RobotConfig
@@ -628,6 +807,8 @@ TESTS = [
     test_stream_inactive_without_polling_policy_keeps_control,
     test_stream_stall_holds_still,
     test_park_ready_takeover_and_rest,
+    test_park_holds_connect_until_ker_in_control,
+    test_guided_recording_session,
     test_can_timeout_script,
 ]
 
