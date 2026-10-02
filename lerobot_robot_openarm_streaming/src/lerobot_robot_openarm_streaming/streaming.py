@@ -30,6 +30,11 @@ class StreamSample:
 class TargetSource(Protocol):
     def sample(self, now: float) -> StreamSample | None: ...
 
+    # Optional: hold_until_ready(check). If present, the follower calls it at the end
+    # of connect(), once its loops are running. It may block until the teleoperator
+    # wants LeRobot's own loop to start (the KER uses it to keep park moves out of
+    # recordings) and should call check() regularly, which raises if a loop has failed.
+
 
 _lock = threading.Lock()
 _source: TargetSource | None = None

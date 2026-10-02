@@ -23,10 +23,11 @@ policies trained on that data run on this follower without changes.
 
 **Status:** KER teleoperation has run on the rig, including `reply_window_ms`
 and the KER plugin's park moves and gesture (see Hardware runs under First time
-on hardware). Recording, policy rollouts, interventions and the CAN timeout
-script have only run against simulated motors. The tests run LeRobot 0.6.2's
-real config parsing, plugin discovery and `DamiaoMotorsBus` code on a virtual
-CAN bus with simulated Damiao motors, and all 14 pass.
+on hardware), and two three-episode recording sessions with streaming encoding.
+Policy rollouts, interventions and the CAN timeout script have only run against
+simulated motors. The tests run LeRobot 0.6.2's real config parsing, plugin
+discovery and `DamiaoMotorsBus` code on a virtual CAN bus with simulated Damiao
+motors, and all 16 pass.
 
 ## Install
 
@@ -69,6 +70,10 @@ add `--teleop.park=true`. Park moves run through the same 250 Hz loops.
 `--teleop.park_gesture=true` adds a hands-free toggle: squeeze both KER triggers
 together twice.
 
+With park on, this follower's `connect()` does not return until the KER is in
+control, and the KER plugin's `get_action()` waits during later parks.
+`lerobot-record` therefore never records a park move or a takeover.
+
 ```bash
 lerobot-teleoperate \
   --config_path=$FLASHRT/helpers/rollout.yaml \
@@ -86,6 +91,10 @@ driven by the control loops either way.
 
 ## Record with the KER
 
+For policy data, use the KER plugin's `lerobot-ker-record` launcher with park on
+(see Guided recording in that plugin's README). It takes the same flags as the
+command below and keeps every park move and takeover out of the data.
+
 ```bash
 lerobot-record \
   --config_path=$FLASHRT/helpers/rollout.yaml \
@@ -96,8 +105,25 @@ lerobot-record \
   --teleop.stream_to_follower=true \
   --dataset.repo_id=${HF_USER}/openarm_ker_demo \
   --dataset.single_task="Put the cup on the plate" \
-  --dataset.fps=30
+  --dataset.fps=30 \
+  --dataset.streaming_encoding=true \
+  --dataset.encoder_threads=1
 ```
+
+**Video encoding and the control loops.** LeRobot's streaming encoder runs in
+threads of the same Python process as the 250 Hz loops. Measured in simulation,
+20 s of three cameras (two 1280x720, one 640x480, libsvtav1):
+
+| Encoding | Loop overruns | Loop rate | Saving the episode |
+|---|---|---|---|
+| after the episode (default) | 0% | 250 Hz | 9.2 s, loop not polled meanwhile |
+| streaming, `encoder_threads=2` or default | 7% | 232-235 Hz | 0.4 s |
+| streaming, `encoder_threads=1` | 1.4% | 249-250 Hz | 0.5 s |
+
+So use `encoder_threads=1`, and check `overruns` in the disconnect stats on the
+rig, where the load differs. `--dataset.rgb_encoder.vcodec=auto` selects
+`h264_nvenc`, which fails to open with LeRobot's default GOP of 2; keep the
+default codec.
 
 `rollout.yaml` says `type: bi_openarm_follower`; the `--robot.type` flag
 overrides it and everything else in the file (ports, classic CAN, joint limits,
@@ -266,15 +292,35 @@ mid-session, call `robot.streaming_stats()` from your own script.
 All with `lerobot-teleoperate`, the KER, `rollout.yaml` (classic CAN, three
 cameras) and the default caps.
 
-| | Run 1: before `reply_window_ms`, 7.8 min | Run 2: `reply_window_ms=2.5`, 43 s |
-|---|---|---|
-| `rate_hz` (left / right) | 250.0 / 249.9 | 248.4 / 247.9 |
-| `overruns` / `ticks` | 85 / 117,616 and 66 / 117,626 (0.07%, 0.06%) | 40 / 10,680 and 28 / 10,688 (0.37%, 0.26%) |
-| `max_work_ms` | 7.35 / 7.71 | 14.05 / 7.31 |
-| `missed_replies` | 17,233 / 17,595 (1.8%, 1.9% of replies) | 20 / 39 (0.02%, 0.05%) |
+| | Run 1: before `reply_window_ms`, 7.8 min | Run 2: `reply_window_ms=2.5`, 43 s | Run 3: `lerobot-record`, 4 min |
+|---|---|---|---|
+| `rate_hz` (left / right) | 250.0 / 249.9 | 248.4 / 247.9 | 249.9 / 249.9 |
+| `overruns` / `ticks` | 85 / 117,616 and 66 / 117,626 (0.07%, 0.06%) | 40 / 10,680 and 28 / 10,688 (0.37%, 0.26%) | 70 / 59,923 and 62 / 59,928 (0.12%, 0.10%) |
+| `max_work_ms` | 7.35 / 7.71 | 14.05 / 7.31 | 51.26 / 47.67 |
+| `missed_replies` | 17,233 / 17,595 (1.8%, 1.9% of replies) | 20 / 39 (0.02%, 0.05%) | 87 / 128 (0.02%, 0.03%) |
 
-- In both runs the arms approached the KER pose slowly, then tracked it, and no
-  motor went silent for more than 0.2 s.
+Run 3 recorded one 40 s episode (1,196 frames at 29.9 Hz, non-streaming
+encoding) with park held out of it. The save that followed hung on a KER-plugin
+bug that is now fixed, and the session was interrupted; the worst ticks of
+about 50 ms happened somewhere in that run.
+
+Recording with streaming encoding (`encoder_threads=1`, three cameras), three
+episodes each:
+
+| | Run 4: `lerobot-record`, 95 s recorded | Run 5: `lerobot-ker-record`, 129 s recorded |
+|---|---|---|
+| `overruns` / `ticks` | 233 / 48,500 and 270 / 48,466 (0.48%, 0.56%) | 688 / 47,668 and 697 / 47,654 (1.44%, 1.46%) |
+| `max_work_ms` | 60.42 / 59.82 | 63.89 / 73.24 |
+| `missed_replies` | 1,321 / 1,419 (0.34%, 0.37%) | 2,088 / 2,204 (0.55%, 0.58%) |
+| dropped video frames | 0 | 0 |
+
+Overruns only happen while the encoder is running, so per recorded second run 5
+had about twice as many as run 4 (5.3 against 2.5 per second per arm); the
+reason for the difference is not known. Run 3, with encoding after the episode,
+had 0.1%.
+
+- In runs 1 and 2 the arms approached the KER pose slowly, then tracked it, and
+  no motor went silent for more than 0.2 s.
 - The reply window removed almost all missed replies on classic CAN.
 - Run 2 was short and includes startup, so its overrun rate and the one 14 ms
   tick are not yet a fair comparison with run 1. Check them on a longer run.
@@ -303,15 +349,20 @@ parameter registers, PD physics and Damiao feedback frames. The tests check:
 - policy-vs-KER priority;
 - stall hold;
 - KER park: hold at rest, the double-squeeze gesture, the ready path, takeover on a rough pose match and on `go`, return to rest;
+- that `connect()` holds until the KER is in control when park is on;
+- a guided recording session with `lerobot-ker-record`: auto ready, takeover, hands-free episode end, a discarded take, return to rest;
 - the CAN timeout script.
 
 The KER tests need `lerobot_teleoperator_openarm_ker` installed.
 
 ## Limitations
 
-- On real hardware, only KER teleoperation (with and without park) has run so
-  far. Recording, policy rollouts, interventions and the CAN timeout script have
-  not.
+- On real hardware, KER teleoperation (with and without park) and recording
+  sessions with streaming encoding have run. Policy rollouts, interventions and
+  the CAN timeout script have not.
+- Streaming encoding raises loop overruns on the rig to between 0.5% and 1.5%
+  of ticks, with worst ticks of 60-75 ms. Encoding after the episode
+  (`--dataset.streaming_encoding=false`) does not.
 - `reply_window_ms=2.5` has been confirmed on this rig's classic CAN bus in one
   short run. Other buses and longer runs may differ, so keep checking
   `missed_replies`.
