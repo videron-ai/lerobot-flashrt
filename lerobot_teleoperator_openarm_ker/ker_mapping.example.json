@@ -1,0 +1,20 @@
+{
+  "joint_signs": {
+    "right_joint_1": 1,
+    "left_joint_1": 1
+  },
+  "joint_offsets": {
+    "right_joint_1": 0.0,
+    "left_joint_1": 0.0
+  },
+  "wrist_remap": {
+    "mode": "v2_to_v1",
+    "handedness": {"right": 1, "left": -1},
+    "j6_limit_deg": 40,
+    "taper_slope": 1.0
+  },
+  "gripper_direction": {
+    "right": -1,
+    "left": 1
+  }
+}

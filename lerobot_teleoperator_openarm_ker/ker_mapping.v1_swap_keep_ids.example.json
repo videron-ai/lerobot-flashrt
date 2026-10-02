@@ -1,0 +1,16 @@
+{
+  "_comment": "OpenArm 1.0 follower, wrist encoder modules physically swapped but NOT reflashed: module ID 7 now measures v1 J6 and ID 6 measures v1 J7 (left: 15 and 14). Channels are 1-based encoder IDs. wrist_remap mode 'none' turns off the default software remap, which this hardware swap replaces. Fill in signs/offsets from the dry run.",
+  "channels": {
+    "right_joint_6": 7,
+    "right_joint_7": 6,
+    "left_joint_6": 15,
+    "left_joint_7": 14
+  },
+  "joint_signs": {},
+  "joint_offsets": {},
+  "wrist_remap": {"mode": "none"},
+  "gripper_direction": {
+    "right": -1,
+    "left": 1
+  }
+}

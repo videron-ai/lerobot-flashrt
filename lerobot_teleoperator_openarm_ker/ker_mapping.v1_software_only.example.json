@@ -1,0 +1,21 @@
+{
+  "_comment": "Spells out the plugin's defaults (with j6_limit_deg raised to 44 for followers that reach +-45): OpenArm 1.0 follower driven by an UNMODIFIED (2.0-order) KER. Channels pair each KER wrist axis with the follower axis pointing the same way; wrist_remap then re-solves J5-J7 so the hand orientation matches exactly. Fill in signs/offsets from single-axis dry runs, then verify handedness with a combined wrist pose.",
+  "channels": {
+    "right_joint_6": 7,
+    "right_joint_7": 6,
+    "left_joint_6": 15,
+    "left_joint_7": 14
+  },
+  "joint_signs": {},
+  "joint_offsets": {},
+  "wrist_remap": {
+    "mode": "v2_to_v1",
+    "handedness": {"right": 1, "left": -1},
+    "j6_limit_deg": 44,
+    "taper_slope": 1.0
+  },
+  "gripper_direction": {
+    "right": -1,
+    "left": 1
+  }
+}

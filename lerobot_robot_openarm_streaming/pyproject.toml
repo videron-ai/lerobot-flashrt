@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+# The "lerobot_robot_" prefix is what lets LeRobot auto-discover this plugin.
+name = "lerobot_robot_openarm_streaming"
+version = "0.1.0"
+description = "Bimanual OpenArm follower that runs its own 250 Hz MIT control loop for LeRobot"
+requires-python = ">=3.12"
+dependencies = [
+    "lerobot",
+    "python-can",
+]
+
+[project.optional-dependencies]
+test = ["pytest", "numpy"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# The tests return a one-line summary so `python tests/test_streaming_follower.py` can print it.
+filterwarnings = ["ignore::pytest.PytestReturnNotNoneWarning"]

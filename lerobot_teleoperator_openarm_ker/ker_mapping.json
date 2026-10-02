@@ -1,0 +1,42 @@
+{
+  "_comment": "Rig mapping from compare_ker_follower.py dry runs. Unmodified KER driving OpenArm 1.0 followers (software wrist remap). Joint 7 is inverted on both sides. j6_limit_deg 44 because this rig's follower J6 limit is +-45 (helpers/rollout.yaml).",
+  "joint_signs": {
+    "right_joint_7": -1,
+    "left_joint_7": -1
+  },
+  "joint_offsets": {},
+  "wrist_remap": {
+    "mode": "v2_to_v1",
+    "handedness": {"right": 1, "left": -1},
+    "j6_limit_deg": 44,
+    "taper_slope": 1.0
+  },
+  "gripper_direction": {
+    "right": -1,
+    "left": 1
+  },
+  "park": {
+    "_comment": "Follower joint space, deg. Rest defaults to the calibration pose (all 0, grippers closed). Waypoints 1-3 follow the policy rollouts in videron/rollout_gen3_level2_multitask_20260913_195707 (medians of 10 episodes): 1) lift with joints 1 and 4 together, upper arms going back, 2) turn the wrists, 3) swing forward with the elbows still bent. Waypoint 4 is the ready pose: upper arms 25 deg forward (left J1 negative, right J1 positive), elbows at 90, everything else neutral. In the rollouts every grasp on the table happens with the forearm about level, so this holds the grippers roughly 15-20 cm above the table.",
+    "ready_path": [
+      {
+        "left_joint_1": 66, "left_joint_2": -3, "left_joint_3": -4, "left_joint_4": 120,
+        "left_joint_5": -1, "left_joint_6": -2,
+        "right_joint_1": -72, "right_joint_2": 11, "right_joint_3": 8, "right_joint_4": 114,
+        "right_joint_5": 4, "right_joint_6": 3
+      },
+      {"left_joint_7": -17, "right_joint_7": 17},
+      {
+        "left_joint_1": 19, "left_joint_2": -2, "left_joint_3": -16, "left_joint_4": 118,
+        "left_joint_5": -2, "left_joint_6": -7, "left_joint_7": 27,
+        "right_joint_1": 0, "right_joint_2": 18, "right_joint_3": 21, "right_joint_4": 105,
+        "right_joint_5": 16, "right_joint_6": 11, "right_joint_7": -35
+      },
+      {
+        "left_joint_1": -25, "left_joint_2": 0, "left_joint_3": 0, "left_joint_4": 90,
+        "left_joint_5": 0, "left_joint_6": 0, "left_joint_7": 0,
+        "right_joint_1": 25, "right_joint_2": 0, "right_joint_3": 0, "right_joint_4": 90,
+        "right_joint_5": 0, "right_joint_6": 0, "right_joint_7": 0
+      }
+    ]
+  }
+}
