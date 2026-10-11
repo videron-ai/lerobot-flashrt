@@ -49,7 +49,11 @@ Saves nothing.
 openarm-stop-repeatability --port can0 --side right --runs 5
 ```
 
-A spread of a few tenths of a degree or less is good.
+A spread of a few tenths of a degree or less is good. A joint whose stop position falls into two groups
+is meeting something before its stop (a cable, or a loose fastener); fix that before calibrating.
+
+Every tool here takes `--no-can-fd` for adapters that only do classic CAN (the device types take
+`use_can_fd: false`). Without it such an adapter fails with `Invalid argument` on the first frame.
 
 ## Calibrate (once per arm)
 
@@ -117,8 +121,11 @@ pair. A constant error in a shoulder motor's torque reading is not separated fro
 prints the zero from the tilted sweeps alone with no constant fitted, which scatters less but would include
 such an error, as a cross-check.
 
-To move a joint's zero by hand instead: `--shift joint_1=1.0` makes every commanded pose sit 1.0° further in that joint's positive
-direction. It only edits the two files; the arm is not touched.
+To move a joint's zero by hand instead: `--shift joint_1=1.0` makes every commanded pose sit 1.0° further
+in that joint's positive direction. It only edits the two files; the arm is not touched.
+
+Every correction changes two files together: the joint's offset in the calibration file, which is what the
+arm uses, and `<id>.stop_trim.json`, which only a later hard-stop calibration reads.
 
 ## Use
 
@@ -137,7 +144,14 @@ robot type.
 
 Only when something changes how a motor sits relative to its joint: the motor's stored zero is rewritten
 (by LeRobot's stock calibration, Enactic's zero tool or Damiao's debugging tool), a motor is replaced, a
-joint is reassembled, or the arm takes a hard knock.
+joint is reassembled, screws are found loose, or the arm takes a hard knock. Nothing drifts with time or
+power cycles.
+
+A hard-stop recalibration reuses the saved stop trim. Repeat the gravity sweep only when the arm's weight
+or mounting changes (gripper, wrist camera, cable routing, link lengths, the base re-levelled).
+
+To check without changing anything, run `openarm-stop-repeatability` and compare the stop positions with
+earlier runs.
 
 ## Safety checks
 

@@ -30,9 +30,9 @@ reinstall is needed.
 ## A session
 
 1. **Rig check** (right column, and the pills in the top bar): CAN interfaces, the
-   three cameras, the KER, the plugins, the followers' calibration, MIT mode and free disk space. The plugins
-   and MIT mode are taken care of when a session starts (see "Automatic preparation"
-   below); the "Install" and "Set MIT mode" buttons do the same by hand.
+   three cameras, the KER, the plugins, the followers' calibration, MIT mode and free disk space. Missing plugins
+   are installed when the GUI starts, and MIT mode is set when a session starts (see
+   "Automatic preparation" below); the "Install" and "Set MIT mode" buttons do the same by hand.
 2. **Session**: task, number of episodes, episode limit, the datasets folder, and
    either a new dataset (`<folder>/<name>_<date>_<time>`) or "Add to" an existing one
    (`--resume=true`). The folder is a path inside the container (the repo is
@@ -82,16 +82,15 @@ Each session's log is also written to `<datasets-dir>/.record_gui/logs/`.
 
 **Automatic preparation**
 
-Every Start first does what used to be typed by hand in a new container:
+The GUI does what used to be typed by hand in a new container. When it starts, and
+again at every Start:
 
-- If any plugin (or `openarm_ker`) is missing, it runs the `pip install -e`
-  commands for the KER teleoperator and the three follower plugins. That only happens in a fresh container, and needs network access there
-  because `openarm_ker` comes from PyPI.
-- The GUI also installs missing plugins as soon as it starts, so in a fresh container the rig check
-  shows them as installed before the first session.
-- The hard-stop followers (`openarm_videron`, `bi_openarm_follower_hardstop`) switch their own motors
-  to MIT mode whenever they connect, from the GUI or a terminal. The step below does the same before the
-  recorder starts, for every robot type.
+- If any plugin (or `openarm_ker`) is missing, it runs the `pip install -e` commands
+  for the KER teleoperator and the three follower plugins. That only happens in a
+  fresh container, and needs network access there because `openarm_ker` comes from PyPI.
+
+At every Start only:
+
 - It reads every motor's control mode (`helpers/set_mit_mode.py --read-only`). Only if
   some motor is not in MIT mode does it run the script for real. So the first session
   after the motors are powered on switches them, and later sessions just pass the
@@ -99,17 +98,23 @@ Every Start first does what used to be typed by hand in a new container:
 - Switching disables the motors first, so the arms go limp for a moment. Start
   sessions with the arms hanging at the rest pose, which the guided workflow expects
   anyway. Nothing else may be driving the CAN buses at that moment.
+- The hard-stop followers (`openarm_videron`, `bi_openarm_follower_hardstop`) also
+  switch their own motors to MIT mode whenever they connect, so they are covered when
+  run from a terminal too.
 - If a step fails the recorder is not started; the banner says which step and the log
   has the output. Stop during *Preparing* cancels the start after the current step.
-- "Install plugins and set MIT mode automatically" under Advanced turns all of this
-  off. Demo mode never does it.
+- "Install plugins and set MIT mode automatically" under Advanced turns the steps at
+  Start off; missing plugins are still installed when the GUI starts. Demo mode does
+  none of it.
 
 **Rig check**
 
 - The default robot is `openarm_videron` with `helpers/rollout_videron.yaml`: the
   250 Hz streaming follower on hard-stop calibrated arms. Its *Calibration* check
-  fails until both arms have a calibration file. Calibrate once from a terminal
-  (`lerobot_robot_openarm_videron/README.md`); a session has no terminal, so it
+  fails until both arms have a calibration file
+  (`<id>_left.json` and `<id>_right.json` in the config's `calibration_dir`). Zero
+  corrections are part of those files, so nothing else has to be loaded. Calibrate
+  once from a terminal (`lerobot_robot_openarm_videron/README.md`); a session has no terminal, so it
   cannot run the calibration itself. Robot type and config file are under Advanced;
   settings saved by an earlier version keep their old values until changed there.
 - The pills in the top bar repeat the checks; hover one for the detail. A failed check
