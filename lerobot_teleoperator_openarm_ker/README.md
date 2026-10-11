@@ -121,8 +121,8 @@ What changes:
   park rest pose (all joints 0) and the mapping file's `joint_offsets` are in
   that frame, so repeat the dry run below after calibrating, with `--hardstop
   --calibration-dir $FLASHRT/calibration/openarm_follower_hardstop` added.
-- **Zero correction.** After the hard-stop calibration, run the gravity sweep
-  once per arm (`openarm-zero-trim ... --gravity`, see
+- **Zero correction.** Each arm's calibration ends with a gravity sweep of
+  joints 1, 2 and 4 (it can also be run alone, see
   `lerobot_robot_openarm_videron/README.md`). On the rig it removed a few
   degrees of error at the shoulders and elbows, which showed as arms hanging
   off vertical and grippers at different heights in the ready pose.

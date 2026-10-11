@@ -8,6 +8,7 @@ import pytest
 from lerobot.motors import Motor, MotorNormMode
 
 import lerobot_robot_openarm_hardstop.calibration as calibration_module
+import lerobot_robot_openarm_hardstop.hardstop_arm as hardstop_arm_module
 
 sys.path.insert(0, str(Path(__file__).parent))
 
@@ -31,6 +32,10 @@ class SimWorld:
     def __init__(self):
         self.arms: dict[str, SimulatedOpenArm] = {}
         self.t = 0.0
+        # Sides whose calibration reached the gravity zero step, which is skipped unless
+        # `run_gravity_zero` is set (most tests' arms have too little gravity for it).
+        self.gravity_zero_calls: list[str] = []
+        self.run_gravity_zero = False
 
     def add(self, port="can0", **kwargs) -> SimulatedOpenArm:
         self.arms[port] = SimulatedOpenArm(**kwargs)
@@ -54,6 +59,13 @@ def world(monkeypatch, tmp_path):
         calibration_module, "time", types.SimpleNamespace(sleep=w.sleep, monotonic=w.monotonic)
     )
     monkeypatch.setattr("builtins.input", lambda *_: "")
+    real_gravity_zero = hardstop_arm_module.run_gravity_zero
+
+    def gravity_zero(arm, side, *args, **kwargs):
+        w.gravity_zero_calls.append(side)
+        return real_gravity_zero(arm, side, *args, **kwargs) if w.run_gravity_zero else {}
+
+    monkeypatch.setattr(hardstop_arm_module, "run_gravity_zero", gravity_zero)
     return w
 
 

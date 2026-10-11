@@ -7,7 +7,7 @@ import logging
 
 from .calibration import position_problems, run_openarm_hard_stop_calibration
 from .offset_bus import OffsetDamiaoMotorsBus
-from .stop_trim import load_stop_trim, stop_trim_path
+from .stop_trim import load_stop_trim, run_gravity_zero, stop_trim_path
 
 logger = logging.getLogger(__name__)
 
@@ -16,11 +16,15 @@ class CalibrationMismatchError(RuntimeError):
     """The saved calibration does not match the arm (e.g. its motors were re-zeroed since)."""
 
 
+class GravityZeroError(RuntimeError):
+    """The gravity zero step of a calibration did not finish. The hard-stop calibration itself was saved."""
+
+
 class HardStopArmMixin:
     """Mixed into OpenArmFollower / OpenArmLeader subclasses.
 
     - Swaps the stock Damiao bus for one that applies the calibration's offsets.
-    - Replaces `calibrate()` with hard-stop calibration.
+    - Replaces `calibrate()` with hard-stop calibration, followed by the gravity zero sweep.
     - Provides the connect-time check that the saved calibration still matches the arm.
     """
 
@@ -29,6 +33,7 @@ class HardStopArmMixin:
         side: str | None,
         check_positions_on_connect: bool,
         joint_limits: dict[str, tuple[float, float]] | None = None,
+        gravity_zero: bool = False,
     ) -> None:
         if side not in ("left", "right"):
             raise ValueError(
@@ -39,6 +44,8 @@ class HardStopArmMixin:
         # User-set joint limits, if any: positions inside them are not a sign of a stale calibration.
         self._hard_stop_joint_limits = joint_limits
         self._check_positions_on_connect = check_positions_on_connect
+        # Follow every hard-stop calibration with the gravity sweep that corrects joints 1, 2 and 4.
+        self._gravity_zero = gravity_zero
         self._calibration_mismatch: list[str] = []
         self.bus = OffsetDamiaoMotorsBus.from_bus(self.bus)
 
@@ -72,7 +79,11 @@ class HardStopArmMixin:
         return position_problems(positions, self._hard_stop_side, self._hard_stop_joint_limits)
 
     def calibrate(self) -> None:
-        """Hard-stop calibration: drive each joint into its stop and save per-joint software offsets."""
+        """Hard-stop calibration: drive each joint into its stop and save per-joint software offsets.
+
+        Then, unless turned off, the gravity sweep: the stops repeat well but their nominal angles can be a
+        few degrees off on a given arm, and the sweep measures where joints 1, 2 and 4 really hang.
+        """
         if self.calibration and not self._calibration_mismatch:
             user_input = input(
                 f"Press ENTER to use the calibration file associated with the id {self.id}, or type 'c' and "
@@ -92,3 +103,13 @@ class HardStopArmMixin:
         self._calibration_mismatch = []
         self._save_calibration()
         print(f"Calibration saved to {self.calibration_fpath}")
+        if not self._gravity_zero:
+            return
+        try:
+            run_gravity_zero(self, self._hard_stop_side)
+        except Exception as e:
+            raise GravityZeroError(
+                f"The hard-stop calibration of {self} is saved, but the gravity zero step did not finish: {e}\n"
+                "Joints 1, 2 and 4 keep the zero from the stops (and any earlier correction). Once the cause "
+                "is fixed, run only this step again with openarm-zero-trim --gravity."
+            ) from e

@@ -188,15 +188,28 @@ def main() -> None:
 
 
 def _gravity_trim(arm, args) -> None:
+    arm.bus.connect()
+    try:
+        run_gravity_zero(arm, args.side, args.joints, args.passes)
+    finally:
+        arm.bus.disconnect(disable_torque=True)
+
+
+def run_gravity_zero(arm, side: str, joints: list[str] | None = None, passes: int = 2) -> dict[str, float]:
+    """Find the joints' zero from gravity torque on a connected, calibrated arm, and save it once the user
+    confirms. The arm moves. Returns the corrections applied (empty if none were).
+
+    Torque is released at the end, also after an error, which is re-raised.
+    """
     from .gravity_zero import GravityZeroFinder, gravity_sweeps
 
-    sweeps = gravity_sweeps(args.side, args.joints)
+    sweeps = gravity_sweeps(side, joints)
     names = ", ".join(sweep.motor for sweep in sweeps)
-    arm.bus.connect()
     apply = False
+    readings: dict[str, float] = {}
     try:
         input(
-            f"\nGravity zero for {names} on the {args.side} arm.\n"
+            f"\nGravity zero for {names} on the {side} arm.\n"
             "The arm WILL MOVE ON ITS OWN: each shoulder joint swings a few degrees either side of hanging, "
             "the elbow bends to 90 degrees and back, and then the upper arm tilts 30 degrees back while the "
             "elbow moves between 10 and 60 degrees.\n"
@@ -204,11 +217,10 @@ def _gravity_trim(arm, args) -> None:
             "  - Let the arm hang straight down, elbow straight\n"
             "Press ENTER to start (Ctrl+C at any time stops the arm and holds it in place)..."
         )
-        fits = GravityZeroFinder(arm.bus).find(sweeps, args.passes)
+        fits = GravityZeroFinder(arm.bus).find(sweeps, passes)
 
         old_trim = load_stop_trim(arm.calibration_fpath)
         print(f"\n  {'joint':<8} {'zero is at':>10} {'±':>6} {'pass diff':>10} {'gravity':>9} {'friction':>9} {'new trim':>9}")
-        readings = {}
         for motor, passes in fits.items():
             fit = passes[-1]
             diff = f"{fit.zero_deg - passes[-2].zero_deg:+.2f}" if len(passes) > 1 else "-"
@@ -246,7 +258,7 @@ def _gravity_trim(arm, args) -> None:
                 print(f"Saved {arm.calibration_fpath} and {stop_trim_path(arm.calibration_fpath)}")
             else:
                 print("Nothing changed.")
-            arm.bus.disconnect(disable_torque=True)
+    return readings if apply else {}
 
 
 if __name__ == "__main__":

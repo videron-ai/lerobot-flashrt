@@ -32,6 +32,9 @@ class BiOpenArmFollowerHardstopConfig(BiOpenArmFollowerConfig):
     `joint_limits` given for an arm are kept; the side's presets apply only when they are left at default.
     """
 
+    # After each arm's hard-stop calibration, find the zero of joints 1, 2 and 4 from gravity torque.
+    gravity_zero: bool = True
+
 
 def hardstop_follower_arms(
     config: BiOpenArmFollowerConfig, robot: BiOpenArmFollower, **arm_options
@@ -61,7 +64,7 @@ class BiOpenArmFollowerHardstop(BiOpenArmFollower):
 
     def __init__(self, config: BiOpenArmFollowerHardstopConfig):
         super().__init__(config)
-        self.left_arm, self.right_arm = hardstop_follower_arms(config, self)
+        self.left_arm, self.right_arm = hardstop_follower_arms(config, self, gravity_zero=config.gravity_zero)
         self.cameras = {**self.left_arm.cameras, **self.right_arm.cameras}
 
 

@@ -8,8 +8,10 @@ does the follower, wherever the arm happens to rest.
 
 This plugin adds OpenArm follower and leader types that calibrate against the arm's mechanical stops
 instead. Each joint is driven slowly into its stop, its position is averaged while pressed against it, and
-the difference from the stop's known angle is saved as a per-joint offset in the calibration file. The
-motors' stored zero is never changed, and nothing is re-zeroed on connect. The joint order and stop angles
+the difference from the stop's known angle is saved as a per-joint offset in the calibration file. A
+follower's calibration then measures the zero of joints 1, 2 and 4 from the arm's own weight, which
+corrects the stops' nominal angles for that arm. The motors' stored zero is never changed, and nothing is
+re-zeroed on connect. The joint order and stop angles
 follow Enactic's `openarm-can-zero-position-calibration` tool.
 
 | Plugin type | Replaces |
@@ -61,6 +63,13 @@ Start with the arm hanging straight down, elbow straight, gripper closed. **The 
 keep the emergency stop in reach. Ctrl+C makes it hold its position; support it, then press ENTER to
 release torque.
 
+A follower's calibration has two parts, one after the other:
+
+1. **Hard stops.** Every joint is pressed into its stop and the offsets are saved.
+2. **Gravity zero.** After a second prompt, joints 1, 2 and 4 are swept slowly to find where the arm
+   really hangs (see the next section). The result is shown and saved once you type `y`. Clear the space
+   in front of, beside and behind the arm for this part.
+
 ```bash
 lerobot-calibrate --robot.type=openarm_follower_hardstop --robot.port=can0 --robot.side=right --robot.id=my_follower
 lerobot-calibrate --teleop.type=openarm_leader_hardstop --teleop.port=can1 --teleop.side=right --teleop.id=my_leader
@@ -76,44 +85,39 @@ lerobot-calibrate --teleop.type=bi_openarm_leader_hardstop --teleop.id=my_bi_lea
   --teleop.left_arm_config.port=can2 --teleop.right_arm_config.port=can3
 ```
 
+The gravity part is on for the follower types (`--robot.gravity_zero=false` skips it) and off for the
+leader types (`--teleop.gravity_zero=true` turns it on for a single leader; its sweeps were tuned on follower
+arms). If it fails or is declined, the hard-stop calibration is still saved; run that part alone later with
+`openarm-zero-trim --gravity`.
+
 Each arm needs `side`. Unlike the stock types, joint limits you set yourself are kept when `side` is set;
 the side's preset limits apply only when `joint_limits` is left at its default.
 
 Calibration files go in their own folders (`.../calibration/robots/openarm_follower_hardstop/` and
 `.../calibration/teleoperators/openarm_leader_hardstop/`), separate from the stock types' files.
 
-## Correct the zero at a reference pose (optional)
+## The gravity zero
 
 The stops are very repeatable, but their angles are nominal design values. On a given arm a stop can sit a
-few degrees from its nominal angle, which shifts that joint's zero by the same amount every time. If the
-calibrated arm does not hang at zero, or the two arms of a pair sit differently in the same pose, correct it
-once per arm:
-
-```bash
-openarm-zero-trim --port can0 --side right --id my_follower
-# bimanual: once per arm, with --id <robot id>_left / <robot id>_right and the robot's --calibration-dir
-```
-
-The arm goes limp and nothing moves. Let it hang straight down, jiggle it so it settles, and confirm. The
-joints given by `--joints` (default `joint_1 joint_2`, which hang vertical under gravity) are made to read
-zero there. The correction is saved next to the calibration file as `<id>.stop_trim.json` and reused by
-every later hard-stop calibration of that arm, so this is not repeated after recalibrating. For other
-joints, hold them at their zero by eye and name them with `--joints`.
-
-A hanging arm settles within a degree or two of vertical, because of friction in the motors. `--gravity`
-measures the zero instead of relying on that:
+few degrees from its nominal angle, which shifts that joint's zero by the same amount every time. The
+calibrated arm then does not hang at zero, or the two arms of a pair sit differently in the same pose.
+So a follower's calibration ends by measuring the zero of joints 1, 2 and 4 from the arm's own weight.
+The same step runs by itself, on an arm that already has a calibration, with:
 
 ```bash
 openarm-zero-trim --port can0 --side right --id my_follower --gravity
+# bimanual: once per arm, with --id <robot id>_left / <robot id>_right and the robot's --calibration-dir
 ```
 
-**The arm moves on its own.** Joints 1 and 2 swing slowly a few degrees either side of hanging. The elbow
-bends to 90° and back, then is swept again between 10° and 60° with the upper arm tilted 30° back, so the
-forearm passes through vertical inside the sweep. Everything runs forward and backward, twice. The torque needed to hold the arm against its own
-weight is zero exactly where it would hang without friction; averaging the two directions cancels the
-friction, and a sine fitted to the rest gives that angle. The result is shown with its uncertainty and how
-far the second pass moved it, and is saved to the same trim file once you confirm. A joint whose fit is too
-uncertain is reported and left alone.
+**The arm moves on its own.** Start with it hanging straight down and keep the emergency stop in reach.
+Joints 1 and 2 swing slowly a few degrees either side of hanging. The elbow bends to 90° and back, then is
+swept again between 10° and 60° with the upper arm tilted 30° back, so the forearm passes through vertical
+inside the sweep. Everything runs forward and backward, twice.
+
+The torque needed to hold the arm against its own weight is zero exactly where it would hang without
+friction; averaging the two directions cancels the friction, and a sine fitted to the rest gives that
+angle. The result is shown with its uncertainty and how far the second pass moved it, and is saved once you
+confirm. A joint whose fit is too uncertain is reported and left alone.
 
 What it finds is where the arm's weight hangs under each joint, which is the same on both arms of a mirrored
 pair. A constant error in a shoulder motor's torque reading is not separated from the zero (about 0.4° per
@@ -121,11 +125,28 @@ pair. A constant error in a shoulder motor's torque reading is not separated fro
 prints the zero from the tilted sweeps alone with no constant fitted, which scatters less but would include
 such an error, as a cross-check.
 
-To move a joint's zero by hand instead: `--shift joint_1=1.0` makes every commanded pose sit 1.0° further
-in that joint's positive direction. It only edits the two files; the arm is not touched.
-
 Every correction changes two files together: the joint's offset in the calibration file, which is what the
-arm uses, and `<id>.stop_trim.json`, which only a later hard-stop calibration reads.
+arm uses, and `<id>.stop_trim.json` beside it, which every later hard-stop calibration of that arm reads.
+A recalibration therefore starts from the corrected stop angles, and the sweep that follows it should find
+the zero within a few tenths of a degree of where it already is. A larger shift means the arm's weight or
+mounting changed, or something moved mechanically.
+
+### Other ways to set the zero
+
+Without `--gravity` the tool moves nothing, which is its default:
+
+```bash
+openarm-zero-trim --port can0 --side right --id my_follower
+```
+
+The arm goes limp. Let it hang straight down, jiggle it so it settles, and confirm. The joints given by
+`--joints` (default `joint_1 joint_2`, which hang vertical under gravity) are made to read zero there. This
+is less accurate than the sweep: friction in the motors lets a hanging arm settle a degree or two from
+vertical. Use it when the arm cannot be allowed to move, or for joints the sweep does not cover, held at
+their zero by eye and named with `--joints`.
+
+To move a joint's zero by hand: `--shift joint_1=1.0` makes every commanded pose sit 1.0° further in that
+joint's positive direction. It only edits the two files; the arm is not touched.
 
 ## Use
 
@@ -147,8 +168,9 @@ Only when something changes how a motor sits relative to its joint: the motor's 
 joint is reassembled, screws are found loose, or the arm takes a hard knock. Nothing drifts with time or
 power cycles.
 
-A hard-stop recalibration reuses the saved stop trim. Repeat the gravity sweep only when the arm's weight
-or mounting changes (gripper, wrist camera, cable routing, link lengths, the base re-levelled).
+A recalibration reuses the saved stop trim and repeats the gravity sweep. Run the sweep alone
+(`openarm-zero-trim --gravity`) when only the arm's weight or mounting changed (gripper, wrist camera,
+cable routing, link lengths, the base re-levelled).
 
 To check without changing anything, run `openarm-stop-repeatability` and compare the stop positions with
 earlier runs.

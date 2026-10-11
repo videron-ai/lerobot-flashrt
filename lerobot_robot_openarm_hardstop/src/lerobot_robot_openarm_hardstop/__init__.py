@@ -17,7 +17,7 @@ from .bimanual import (
 )
 from .calibration import CalibrationAbortedError
 from .follower import OpenArmFollowerHardstop, OpenArmFollowerHardstopConfig
-from .hardstop_arm import CalibrationMismatchError
+from .hardstop_arm import CalibrationMismatchError, GravityZeroError
 from .leader import OpenArmLeaderHardstop, OpenArmLeaderHardstopConfig
 from .offset_bus import IncompatibleLeRobotError, OffsetDamiaoMotorsBus
 
@@ -30,6 +30,7 @@ __all__ = [
     "BiOpenArmLeaderHardstopConfig",
     "CalibrationAbortedError",
     "CalibrationMismatchError",
+    "GravityZeroError",
     "IncompatibleLeRobotError",
     "OffsetDamiaoMotorsBus",
     "OpenArmFollowerHardstop",

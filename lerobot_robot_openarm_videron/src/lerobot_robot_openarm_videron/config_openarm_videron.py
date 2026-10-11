@@ -18,10 +18,14 @@ class OpenArmVideronConfig(BiOpenArmStreamingFollowerConfig):
     * `joint_limits` given for an arm are kept even though `side` is set. The side's
       preset limits apply only when `joint_limits` is left at its default.
     * Calibration is the hard-stop calibration of lerobot_robot_openarm_hardstop
-      (`lerobot-calibrate --robot.type=openarm_videron ...`). The motors are never
-      re-zeroed.
+      (`lerobot-calibrate --robot.type=openarm_videron ...`), followed by its gravity
+      zero sweep. The motors are never re-zeroed.
     """
 
     # Refuse to connect if a joint reads clearly outside its range, which means the
     # saved calibration no longer matches the motors.
     check_positions_on_connect: bool = True
+
+    # After each arm's hard-stop calibration, sweep joints 1, 2 and 4 to find their zero
+    # from gravity torque. The arm moves; the result is confirmed before it is saved.
+    gravity_zero: bool = True

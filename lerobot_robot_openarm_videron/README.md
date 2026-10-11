@@ -49,7 +49,9 @@ The record GUI (`record_gui/`) installs all four by itself when it starts.
 ## Calibrate (once per arm)
 
 Start with both arms hanging straight down, elbows straight, grippers closed. **The arms move on
-their own**, one after the other; keep the emergency stop in reach. Run from the repo root:
+their own**, one after the other; keep the emergency stop in reach. Each arm is first pressed into
+its hard stops, then, after a second prompt, swept slowly through joints 1, 2 and 4 to find its zero
+from gravity. That result is shown and saved once you type `y`. Run from the repo root:
 
 ```bash
 lerobot-calibrate --robot.type=openarm_videron --robot.id=my_bimanual_follower \
@@ -70,12 +72,13 @@ To check how repeatable an arm's stops are first, without saving anything:
 openarm-stop-repeatability --port left_arm --side left --runs 5 --no-can-fd
 ```
 
-### Correct the zeros (once per arm)
+### The gravity zero
 
 The stops repeat very well, but their nominal angles can be a few degrees off on a given arm. On the
 rig that left the arms hanging slightly off vertical and one gripper higher than the other at the
 ready pose. The gravity sweep measures where each arm really hangs and corrects joints 1, 2 and 4.
-**The arm moves on its own.** Run it for each arm, from the repo root:
+It is part of the calibration above (`--robot.gravity_zero=false` skips it). To run it alone on an
+arm that is already calibrated (**the arm moves on its own**), from the repo root:
 
 ```bash
 openarm-zero-trim --port left_arm --side left --id my_bimanual_follower_left \
@@ -96,7 +99,7 @@ Nothing drifts with time or power cycles, so there is no schedule.
 - **Hard-stop calibration again:** a motor's stored zero is rewritten (LeRobot's stock calibration,
   Enactic's zero tool, Damiao's debugging tool), a motor is replaced, a joint is reassembled, screws
   are found loose, the arm takes a hard knock, or the connect-time check refuses to start.
-- **Gravity sweep again:** the arm's weight or mounting changes (gripper, wrist camera, cable
+- **Gravity sweep alone:** the arm's weight or mounting changes (gripper, wrist camera, cable
   routing, link extensions, the tower moved or re-levelled).
 - **To check without changing anything:** look at the rest and ready poses each session, and run
   `openarm-stop-repeatability` after moving the rig. A stop that has moved by more than about

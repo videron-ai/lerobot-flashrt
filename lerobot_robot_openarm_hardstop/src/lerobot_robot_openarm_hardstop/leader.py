@@ -30,6 +30,10 @@ class OpenArmLeaderHardstopConfig(OpenArmLeaderConfig):
     # calibration no longer matches the motors.
     check_positions_on_connect: bool = True
 
+    # Follow every hard-stop calibration with the gravity sweep of joints 1, 2 and 4 (see the follower).
+    # Off by default: the sweep's speeds and torque limits were tuned on follower arms only.
+    gravity_zero: bool = False
+
 
 class OpenArmLeaderHardstop(HardStopArmMixin, OpenArmLeader):
     config_class = OpenArmLeaderHardstopConfig
@@ -37,7 +41,9 @@ class OpenArmLeaderHardstop(HardStopArmMixin, OpenArmLeader):
 
     def __init__(self, config: OpenArmLeaderHardstopConfig):
         super().__init__(config)
-        self._setup_hard_stop(config.side, config.check_positions_on_connect)
+        self._setup_hard_stop(
+            config.side, config.check_positions_on_connect, gravity_zero=config.gravity_zero
+        )
 
     def connect(self, calibrate: bool = True) -> None:
         """Like the stock leader's connect(), except the motors are never re-zeroed.

@@ -13,6 +13,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "lerobot_robot_openarm_hardstop" / "tests"))
 
 import lerobot_robot_openarm_hardstop.calibration as calibration_module  # noqa: E402
+import lerobot_robot_openarm_hardstop.hardstop_arm as hardstop_arm_module  # noqa: E402
 from lerobot_robot_openarm_streaming import bi_openarm_streaming_follower as streaming_module  # noqa: E402
 from sim_openarm import SUBSTEP_S, SimulatedOpenArm  # noqa: E402
 
@@ -43,6 +44,9 @@ class SimWorld:
         self.t = 0.0
         self.answers: list[str] = []  # typed answers to prompts, in order; ENTER once they run out
         self.prompts: list[str] = []
+        # Sides whose calibration reached the gravity zero step. The step itself is skipped: it has its
+        # own tests in the hard-stop plugin and these arms carry too little gravity for it.
+        self.gravity_zero_calls: list[str] = []
 
     def add(self, port, **kwargs) -> RealtimeArm:
         self.arms[port] = RealtimeArm(**kwargs)
@@ -73,6 +77,9 @@ def world(monkeypatch):
         calibration_module, "time", types.SimpleNamespace(sleep=w.sleep, monotonic=w.monotonic)
     )
     monkeypatch.setattr("builtins.input", w.input)
+    monkeypatch.setattr(
+        hardstop_arm_module, "run_gravity_zero", lambda arm, side: w.gravity_zero_calls.append(side) or {}
+    )
 
     follower = streaming_module.BiOpenArmStreamingFollower
     start, stop = follower._start_loops, follower._stop_loops
