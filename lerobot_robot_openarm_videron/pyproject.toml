@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+# The "lerobot_robot_" prefix is what lets LeRobot auto-discover this plugin.
+name = "lerobot_robot_openarm_videron"
+version = "0.1.0"
+description = "Bimanual OpenArm follower for LeRobot: 250 Hz MIT control loop plus hard-stop calibration"
+requires-python = ">=3.12"
+dependencies = [
+    "lerobot",
+    # Both live next to this package in the lerobot-flashrt repo; install them first (see README).
+    "lerobot_robot_openarm_streaming>=0.1.0",
+    "lerobot_robot_openarm_hardstop>=0.1.0",
+]
+
+[project.optional-dependencies]
+test = ["pytest", "numpy"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
