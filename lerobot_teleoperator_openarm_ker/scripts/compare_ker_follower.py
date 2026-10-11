@@ -11,6 +11,16 @@ arms (or let them hang at rest) before running. Calibrate the followers with
 
 Without --mapping the plugin's defaults apply, including the software wrist remap.
 
+For followers calibrated against their hard stops (openarm_videron, or the
+lerobot_robot_openarm_hardstop types), add --hardstop and the folder holding their
+calibration files, so the follower column is in the calibrated joint frame the
+recording will use:
+
+    python scripts/compare_ker_follower.py --left-port left_arm --right-port right_arm \
+        --left-id my_bimanual_follower_left --right-id my_bimanual_follower_right \
+        --no-can-fd --hardstop --calibration-dir ../calibration/openarm_follower_hardstop \
+        [--mapping ker_mapping.json]
+
 1. Put both followers and the KER in the same pose (arms hanging, grippers
    closed). The DELTA column is then the offset to put in the mapping file.
 2. Move one KER joint and the same follower joint by hand in the same physical
@@ -20,6 +30,7 @@ Without --mapping the plugin's defaults apply, including the software wrist rema
 import argparse
 import sys
 import time
+from pathlib import Path
 
 from lerobot.robots.openarm_follower import OpenArmFollower, OpenArmFollowerConfig
 
@@ -36,15 +47,31 @@ def main() -> None:
     p.add_argument("--right-id", default=None)
     p.add_argument("--mapping", default=None, help="Mapping JSON to test (optional)")
     p.add_argument("--no-can-fd", action="store_true", help="Classic CAN (use_can_fd: False on the follower)")
+    p.add_argument("--hardstop", action="store_true", help="Followers use hard-stop calibration (openarm_videron)")
+    p.add_argument("--calibration-dir", type=Path, default=None, help="Folder with the followers' calibration files")
     args = p.parse_args()
 
+    if args.hardstop:
+        # Its motor bus applies the calibration's zero offsets to every position it reads.
+        from lerobot_robot_openarm_hardstop import OpenArmFollowerHardstop as Follower
+        from lerobot_robot_openarm_hardstop import OpenArmFollowerHardstopConfig as FollowerConfig
+    else:
+        Follower, FollowerConfig = OpenArmFollower, OpenArmFollowerConfig
     followers = {
-        side: OpenArmFollower(OpenArmFollowerConfig(port=port, side=side, id=id_, use_can_fd=not args.no_can_fd))
+        side: Follower(
+            FollowerConfig(
+                port=port, side=side, id=id_, use_can_fd=not args.no_can_fd, calibration_dir=args.calibration_dir
+            )
+        )
         for side, port, id_ in (
             ("left", args.left_port, args.left_id),
             ("right", args.right_port, args.right_id),
         )
     }
+    if args.hardstop:
+        missing = [str(f.calibration_fpath) for f in followers.values() if not f.is_calibrated]
+        if missing:
+            sys.exit(f"No hard-stop calibration at {', '.join(missing)}. Run lerobot-calibrate first.")
     for f in followers.values():
         f.bus.connect()  # handshake pings (and enables) each motor; no MIT command is sent
 

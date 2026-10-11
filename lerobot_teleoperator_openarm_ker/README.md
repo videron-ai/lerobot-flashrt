@@ -94,6 +94,46 @@ LeRobot auto-imports any installed package whose name starts with
   re-zeroing. Since LeRobot 0.6.1 the follower no longer re-zeroes itself on
   every connect, so the zero set here is the one every later session uses.
 
+### Hard-stop calibrated followers (`openarm_videron`)
+
+`--robot.type=openarm_videron` (from `lerobot_robot_openarm_videron`) is
+`bi_openarm_streaming_follower` on arms calibrated against their mechanical
+stops. Everything in this README that says `bi_openarm_streaming_follower`
+works the same with it: streaming, park, the park hold and guided recording.
+What changes:
+
+- **Config file.** Use `helpers/rollout_videron.yaml` in place of
+  `rollout.yaml`. It already says `type: openarm_videron`, so the
+  `--robot.type` flag can be left off. It keeps the rig's custom joint limits
+  (gripper 0 to -160 deg) and points at its own calibration folder.
+- **Calibration.** Run this in place of the command above. Each joint is
+  driven into its stop; the motors' own zero is not rewritten.
+
+  ```bash
+  lerobot-calibrate --robot.type=openarm_videron --robot.id=my_bimanual_follower \
+    --robot.calibration_dir=$FLASHRT/calibration/openarm_follower_hardstop \
+    --robot.left_arm_config.port=left_arm --robot.left_arm_config.use_can_fd=false \
+    --robot.right_arm_config.port=right_arm --robot.right_arm_config.use_can_fd=false
+  ```
+
+- **Zero pose.** The followers' zero is now the true hanging pose found from
+  the stops, not wherever the arms were held during the stock calibration. The
+  park rest pose (all joints 0) and the mapping file's `joint_offsets` are in
+  that frame, so repeat the dry run below after calibrating, with `--hardstop
+  --calibration-dir $FLASHRT/calibration/openarm_follower_hardstop` added.
+- **Zero correction.** After the hard-stop calibration, run the gravity sweep
+  once per arm (`openarm-zero-trim ... --gravity`, see
+  `lerobot_robot_openarm_videron/README.md`). On the rig it removed a few
+  degrees of error at the shoulders and elbows, which showed as arms hanging
+  off vertical and grippers at different heights in the ready pose.
+- **MIT mode.** These followers switch their motors to MIT mode when they
+  connect, so `helpers/set_mit_mode.py` is not needed after a power cycle.
+- **Do not run the stock calibration afterwards.** It rewrites the motors'
+  zero, which the saved hard-stop offsets are relative to. If that happens,
+  run the hard-stop calibration again.
+- **Datasets** record `openarm_videron` as their robot type, because the joint
+  frame differs from `bi_openarm_follower` data by each motor's zero offset.
+
 ## 3. Dry run: check signs and offsets (nothing moves)
 
 The KER firmware's zero offsets and joint directions were tuned for Enactic's own
@@ -225,7 +265,8 @@ By default LeRobot reads the KER once per recorded frame and sends that to the
 followers, so at 30 fps they move in 33 ms steps. With
 `--teleop.stream_to_follower=true` and
 `--robot.type=bi_openarm_streaming_follower` (from
-`lerobot_robot_openarm_streaming`), the follower's 250 Hz control loops read the
+`lerobot_robot_openarm_streaming`) or `--robot.type=openarm_videron` (the same
+loops on hard-stop calibrated arms), the follower's 250 Hz control loops read the
 KER directly:
 - Every KER frame (500 Hz) is filtered and mapped once, wrist remap included.
 - The loops send the result with velocity feed-forward.
@@ -586,7 +627,7 @@ warning; the speed caps and slow approach replace it.
 | `gripper_open_deg` / `gripper_closed_deg` | `-160` / `0` | follower gripper range; matches the gripper `joint_limits` in `rollout.yaml` (LeRobot's `side` presets clip it to `-65`) |
 | `filter` | `none` | `none` or `one_euro` (see Smoothing) |
 | `filter_min_cutoff_hz` / `filter_beta` / `filter_d_cutoff_hz` | `1.0` / `0.05` / `1.0` | One Euro settings: smoothing at rest / lag on fast moves / speed estimate |
-| `stream_to_follower` | `false` | feed `bi_openarm_streaming_follower`'s control loops at the KER's rate (see Streaming) |
+| `stream_to_follower` | `false` | feed the control loops of `openarm_videron` / `bi_openarm_streaming_follower` at the KER's rate (see Streaming) |
 | `park` | `false` | start at the rest pose and accept `ready` / `go` / `rest` commands (see Park) |
 | `park_speed_deg_s` | `40` | peak joint speed of park moves and of the takeover (grippers 4x) |
 | `park_engage_joints` | `[1, 2, 3, 4]` | joints of each arm the KER must match at the ready pose to take over |

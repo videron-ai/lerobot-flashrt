@@ -25,7 +25,8 @@ class OpenArmKERConfig(TeleoperatorConfig):
     gripper_travel_deg: float = 60.0
     # Follower gripper range on this rig: 0 deg = closed, -160 deg = fully open
     # (matches the gripper joint_limits in lerobot-flashrt's helpers/rollout.yaml).
-    # LeRobot's side="left"/"right" presets clip the gripper to -65 instead.
+    # LeRobot's side="left"/"right" presets clip the gripper to -65 instead, on the
+    # stock and streaming followers; openarm_videron keeps the configured limits.
     gripper_open_deg: float = -160.0
     gripper_closed_deg: float = 0.0
 
@@ -43,11 +44,12 @@ class OpenArmKERConfig(TeleoperatorConfig):
 
     # Feed targets straight into lerobot_robot_openarm_streaming's control loop at the
     # KER's own rate (500 Hz) instead of once per recorded frame. Requires that
-    # plugin and --robot.type=bi_openarm_streaming_follower. The filter then runs on
-    # every KER frame; get_action() still returns (and records) the same targets.
+    # plugin and a robot built on it: --robot.type=openarm_videron (hard-stop
+    # calibrated) or bi_openarm_streaming_follower. The filter then runs on every
+    # KER frame; get_action() still returns (and records) the same targets.
     stream_to_follower: bool = False
 
-    # Park: start by holding the followers' rest pose (their calibration pose, arms
+    # Park: start by holding the followers' rest pose (their zero pose, arms
     # dangling) and ignore the KER. Typing "ready" + ENTER in the terminal moves them
     # along the mapping file's "park" ready_path to the ready pose above the work
     # surface, at no more than park_speed_deg_s per joint. The KER takes over once
@@ -64,10 +66,11 @@ class OpenArmKERConfig(TeleoperatorConfig):
     park_engage_tolerance_deg: float = 20.0
     park_engage_hold_s: float = 0.5
     park_go_delay_s: float = 3.0
-    # With the streaming follower, make LeRobot's loop wait whenever the arms are
-    # parked: the robot's connect() returns only once the KER is in control, and
-    # get_action() blocks during later park moves and takeovers. lerobot-record
-    # then never records them. The stock follower cannot do this.
+    # With a streaming follower (openarm_videron or bi_openarm_streaming_follower),
+    # make LeRobot's loop wait whenever the arms are parked: the robot's connect()
+    # returns only once the KER is in control, and get_action() blocks during later
+    # park moves and takeovers. lerobot-record then never records them. The stock
+    # follower cannot do this.
     park_hold: bool = True
     # Read ready / go / rest (+ ENTER) from the terminal. Always off under
     # lerobot-record, whose own n / r / q keys read the same terminal.

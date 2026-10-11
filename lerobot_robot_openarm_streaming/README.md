@@ -21,6 +21,12 @@ the dataset `robot_type`, features, keys and calibration files all match the
 stock follower. New episodes merge with your existing OpenArm 1.0 data, and
 policies trained on that data run on this follower without changes.
 
+For the same follower on arms calibrated against their mechanical stops, see
+`lerobot_robot_openarm_videron` (`--robot.type=openarm_videron`), which is built on
+this plugin. That type also switches the motors to MIT mode when it connects; this
+one expects them to be in MIT mode already (`helpers/set_mit_mode.py`, or the
+record GUI, which runs it before a session).
+
 **Status:** KER teleoperation has run on the rig, including `reply_window_ms`
 and the KER plugin's park moves and gesture (see Hardware runs under First time
 on hardware), and two three-episode recording sessions with streaming encoding.

@@ -379,7 +379,8 @@ class OpenArmKER(Teleoperator):
             except ImportError as e:
                 self.disconnect()
                 raise ImportError(
-                    "stream_to_follower=true needs the lerobot_robot_openarm_streaming plugin installed"
+                    "stream_to_follower=true needs the lerobot_robot_openarm_streaming plugin installed "
+                    "(openarm_videron and bi_openarm_streaming_follower both use it)"
                 ) from e
             self._source = _KERTargetSource(self)
             register_target_source(self._source)

@@ -850,6 +850,36 @@ class _TimedProcessor:
 _PROFILER: "_LatencyProfiler | None" = None
 
 
+# Key under which the engine's raw task string rides along with a preprocessed
+# batch.  Namespaced so it cannot collide with a lerobot feature key.
+_RAW_TASK_KEY = "flashrt.raw_task"
+
+
+class _RawTaskPreprocessor:
+    """Proxy that carries the raw task string through the preprocessor.
+
+    The PI05 preprocessor rewrites ``batch["task"]`` into the full training
+    prompt (``"Task: ..., State: ...;\nAction: "``), but FlashRT builds that
+    prompt itself from the plain task and the state.  Stashing the task the
+    engine asked for lets ``predict_action_chunk`` follow ``engine.set_task``
+    instead of the task FlashRT was loaded with.  ``reset`` and the other
+    attributes are forwarded.
+    """
+
+    def __init__(self, inner):
+        self._inner = inner
+
+    def __call__(self, batch, *args, **kwargs):
+        task = batch.get("task") if isinstance(batch, dict) else None
+        out = self._inner(batch, *args, **kwargs)
+        if isinstance(task, (list, tuple)) and task and isinstance(out, dict):
+            out[_RAW_TASK_KEY] = task[0]
+        return out
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
 def _prof_step(name: str):
     """Profiler stage context for code that runs inside a chunk; no-op when off."""
     return _PROFILER.step(name) if _PROFILER is not None else nullcontext()
@@ -1144,11 +1174,16 @@ def _install_flashrt_backend(ctx, cfg: RolloutConfig) -> None:
             )
             _state_dim_warned = True
 
+        # The engine's current task (see _RawTaskPreprocessor), falling back to
+        # the load-time task when the batch did not come through the engine.
+        # A new task only re-embeds the prompt; the fixed-shape graph is reused.
+        prompt = batch.get(_RAW_TASK_KEY) or _task
+
         # FlashRT inference — returns (chunk_size, 32) normalized actions
         with torch.no_grad(), _prof_step("flashrt_predict"):
             chunk_np = _model.predict(
                 images=imgs,
-                prompt=_task,
+                prompt=prompt,
                 state=state_np,
                 prev_actions=prev_np,
                 inference_delay=int(kwargs.get("inference_delay") or 0),
@@ -1166,6 +1201,12 @@ def _install_flashrt_backend(ctx, cfg: RolloutConfig) -> None:
     # Bind and install on the policy instance — shadows the class method so
     # both ctx.policy.policy and ctx.policy.inference._policy see the new impl.
     policy.predict_action_chunk = types.MethodType(predict_action_chunk, policy)
+
+    # Carry the engine's task to predict_action_chunk so engine.set_task()
+    # changes FlashRT's prompt.  Only the engine's reference is wrapped;
+    # calibration and warmup use ctx.policy.preprocessor directly.
+    engine = ctx.policy.inference
+    engine._preprocessor = _RawTaskPreprocessor(engine._preprocessor)
 
     logger.info(
         "FlashRT backend installed | action_dim=%d  chunk=%d  state_dim=%d  views=%s  task=%r",
