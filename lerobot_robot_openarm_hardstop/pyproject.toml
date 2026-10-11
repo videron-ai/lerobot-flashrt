@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=70"]
+build-backend = "setuptools.build_meta"
+
+[project]
+# The name must keep its underscores: LeRobot finds plugins by the `lerobot_robot_` prefix and imports
+# the package under this exact name.
+name = "lerobot_robot_openarm_hardstop"
+version = "0.1.0"
+description = "Hard-stop zero calibration for OpenArm arms (follower and leader) in LeRobot"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.10"
+dependencies = [
+    # OpenArm support and the Damiao motor bus arrived in LeRobot 0.4.4.
+    "lerobot[openarms]>=0.4.4",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
+[project.scripts]
+openarm-stop-repeatability = "lerobot_robot_openarm_hardstop.calibration:main"
+openarm-zero-trim = "lerobot_robot_openarm_hardstop.stop_trim:main"
+
+# src layout: with the package at the project root, an editable install is shadowed by the project folder
+# itself whenever Python runs from the folder above it (the folder has the same name as the package).
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "N"]
+# Long user-facing messages; the formatter keeps code within line-length.
+ignore = ["E501"]
