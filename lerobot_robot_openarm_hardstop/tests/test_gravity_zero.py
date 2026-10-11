@@ -7,9 +7,13 @@ import numpy as np
 import pytest
 from conftest import HIDDEN_ZERO
 from lerobot.robots.utils import make_robot_from_config
-from sim_openarm import MOTORS
+from sim_openarm import MOTORS, STOPS
 
-from lerobot_robot_openarm_hardstop import CalibrationAbortedError, OpenArmFollowerHardstopConfig
+from lerobot_robot_openarm_hardstop import (
+    CalibrationAbortedError,
+    GravityZeroError,
+    OpenArmFollowerHardstopConfig,
+)
 from lerobot_robot_openarm_hardstop.calibration import offsets_to_calibration
 from lerobot_robot_openarm_hardstop.gravity_zero import (
     GravityZeroFinder,
@@ -17,7 +21,7 @@ from lerobot_robot_openarm_hardstop.gravity_zero import (
     fit_gravity_zero,
     gravity_sweeps,
 )
-from lerobot_robot_openarm_hardstop.stop_trim import apply_zero_trim, read_mean_positions
+from lerobot_robot_openarm_hardstop.stop_trim import apply_zero_trim, load_stop_trim, read_mean_positions
 
 # Roughly the rig's arm: about 13 Nm to hold a shoulder joint horizontal, 2.5 Nm for the forearm.
 ARM_GRAVITY = np.array([13.0, 13.0, 0.0, 2.5, 0.0, 0.3, 0.0, 0.0])
@@ -126,4 +130,46 @@ def test_finder_stops_when_a_joint_is_blocked(world, tmp_path):
     arm.bus.connect()
     with pytest.raises(CalibrationAbortedError, match="in its way"):
         GravityZeroFinder(arm.bus).find(gravity_sweeps("right", ["joint_1"]))
+    arm.bus.disconnect(True)
+
+
+def test_calibration_ends_with_the_gravity_zero(world, tmp_path, monkeypatch):
+    """A first connect on an arm whose shoulder stops are not at their nominal angles: the hard-stop
+    calibration alone would leave the zero off by the stops' error; the gravity step that follows fixes it."""
+    stops = {**STOPS["right"], "joint_1": (-82.5, 200.0), "joint_2": (-13.0, 100.0)}
+    sim = world.add(side="right", hidden_zero_deg=HIDDEN_ZERO, stops=stops, gravity=ARM_GRAVITY, start_deg={})
+    sim.forearm_pitch_gain = 1.0
+    world.run_gravity_zero = True
+    prompts = []
+    monkeypatch.setattr("builtins.input", lambda p="": prompts.append(p) or ("y" if "Make it" in p else ""))
+    arm = make_robot_from_config(
+        OpenArmFollowerHardstopConfig(port="can0", side="right", id="sim", calibration_dir=tmp_path)
+    )
+    arm.connect()
+
+    assert world.gravity_zero_calls == ["right"]
+    assert any("Hard-stop calibration" in p for p in prompts) and any("Gravity zero" in p for p in prompts)
+    # The saved zero is the true one, and the stops' error is on file for later hard-stop calibrations.
+    for motor in MOTORS:
+        assert arm.calibration[motor].homing_offset / 1000 == pytest.approx(HIDDEN_ZERO[motor], abs=0.4), motor
+    trim = load_stop_trim(arm.calibration_fpath)
+    assert trim["joint_1"] == pytest.approx(-2.5, abs=0.4)
+    assert trim["joint_2"] == pytest.approx(-3.0, abs=0.4)
+    positions = read_mean_positions(arm.bus, 0.1)
+    for motor in ("joint_1", "joint_2", "joint_4"):
+        assert positions[motor] == pytest.approx(sim.calibrated_deg(motor), abs=0.4), motor
+    arm.disconnect()
+
+
+def test_calibration_says_so_when_the_gravity_zero_fails(world, tmp_path):
+    world.add(side="right", hidden_zero_deg=HIDDEN_ZERO, gravity=np.zeros(len(MOTORS)), start_deg={})
+    world.run_gravity_zero = True
+    arm = make_robot_from_config(
+        OpenArmFollowerHardstopConfig(port="can0", side="right", id="sim", calibration_dir=tmp_path)
+    )
+    with pytest.raises(GravityZeroError, match="hard-stop calibration .* is saved"):
+        arm.connect()
+    # The hard-stop calibration is kept and no correction was written.
+    assert arm.calibration_fpath.is_file()
+    assert load_stop_trim(arm.calibration_fpath) == {}
     arm.bus.disconnect(True)

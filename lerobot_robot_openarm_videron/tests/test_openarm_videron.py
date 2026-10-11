@@ -114,6 +114,8 @@ def test_first_connect_calibrates_then_streams_in_the_calibrated_frame(world, tm
             for motor in MOTORS:
                 assert saved[motor]["homing_offset"] / 1000 == pytest.approx(HIDDEN_ZERO[side][motor], abs=0.2)
             assert sims[side].set_zero_count == 0  # the motors' own zero is never rewritten
+        # Each arm's hard-stop calibration was followed by its gravity zero step.
+        assert world.gravity_zero_calls == list(SIDES)
         assert all(s["ticks"] > 0 for s in robot.streaming_stats().values())
         assert_observes_true_angles(robot, sims)
 

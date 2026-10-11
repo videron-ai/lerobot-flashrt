@@ -38,7 +38,10 @@ class OpenArmVideron(BiOpenArmStreamingFollower):
                 arm_config.side = side
         super().__init__(config)
         self.left_arm, self.right_arm = hardstop_follower_arms(
-            config, self, check_positions_on_connect=config.check_positions_on_connect
+            config,
+            self,
+            check_positions_on_connect=config.check_positions_on_connect,
+            gravity_zero=config.gravity_zero,
         )
         self.cameras = {**self.left_arm.cameras, **self.right_arm.cameras}
 

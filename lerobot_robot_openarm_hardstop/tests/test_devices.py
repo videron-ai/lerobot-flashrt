@@ -236,3 +236,32 @@ def test_lerobot_discovers_installed_plugin():
         [sys.executable, "-c", code], capture_output=True, text=True, env=os.environ.copy(), check=True
     ).stdout.split()
     assert out[-2:] == ["OpenArmFollowerHardstopConfig", "BiOpenArmLeaderHardstopConfig"]
+
+
+def test_gravity_zero_follows_follower_calibration_unless_turned_off(world, tmp_path):
+    world.add(hidden_zero_deg=HIDDEN_ZERO)
+    robot = make_robot_from_config(follower_config(tmp_path / "on"))
+    robot.connect()
+    assert world.gravity_zero_calls == ["right"]
+    robot.disconnect()
+
+    # A saved calibration is reused without it.
+    robot = make_robot_from_config(follower_config(tmp_path / "on"))
+    robot.connect()
+    assert world.gravity_zero_calls == ["right"]
+    robot.disconnect()
+
+    robot = make_robot_from_config(follower_config(tmp_path / "off", gravity_zero=False))
+    robot.connect()
+    assert world.gravity_zero_calls == ["right"]
+    robot.disconnect()
+
+
+def test_leader_calibration_has_no_gravity_zero_by_default(world, tmp_path):
+    world.add(port="can1", side="left", hidden_zero_deg=HIDDEN_ZERO)
+    leader = make_teleoperator_from_config(
+        OpenArmLeaderHardstopConfig(port="can1", side="left", id="sim", calibration_dir=tmp_path)
+    )
+    leader.connect()
+    assert world.gravity_zero_calls == []
+    leader.disconnect()

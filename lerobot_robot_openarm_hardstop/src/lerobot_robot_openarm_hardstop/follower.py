@@ -30,6 +30,10 @@ class OpenArmFollowerHardstopConfig(OpenArmFollowerConfig):
     # calibration no longer matches the motors.
     check_positions_on_connect: bool = True
 
+    # After every hard-stop calibration, sweep joints 1, 2 and 4 to find their zero from gravity torque and
+    # correct the stops' nominal angles for this arm. The arm moves; the result is confirmed before saving.
+    gravity_zero: bool = True
+
 
 def custom_joint_limits(config: OpenArmFollowerConfig) -> dict[str, tuple[float, float]] | None:
     """The config's joint limits if they were set by the user, else None."""
@@ -49,7 +53,9 @@ class OpenArmFollowerHardstop(HardStopArmMixin, OpenArmFollower):
         if custom_limits is not None:
             config.joint_limits = custom_limits
             logger.info(f"Keeping the configured joint limits: {custom_limits}.")
-        self._setup_hard_stop(config.side, config.check_positions_on_connect, custom_limits)
+        self._setup_hard_stop(
+            config.side, config.check_positions_on_connect, custom_limits, gravity_zero=config.gravity_zero
+        )
 
     def connect(self, calibrate: bool = True) -> None:
         """Like the stock follower's connect(), except the motors are never re-zeroed.
